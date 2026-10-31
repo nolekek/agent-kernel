@@ -1,0 +1,33 @@
+# Rust & Cargo
+/target/
+**/*.rs.bk
+*.pdb
+
+# Environment & Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Ephemeral runtime & sockets
+*.sock
+*.pid
+/run/
+/tmp/
+
+# IDE & Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs & Traces
+*.log
+logs/
