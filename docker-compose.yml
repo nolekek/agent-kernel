@@ -1,0 +1,84 @@
+# ==============================================================================
+# AgentKernel Production Stack: Micro-Sandbox Daemon, Prometheus & Grafana
+# ==============================================================================
+
+services:
+  agentkernel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: agentkernel:latest
+    container_name: agentkernel
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mount host cgroups hierarchy for isolate resource accounting & control
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - agentkernel_data:/var/lib/agentkernel
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      - RUST_LOG=info
+      - AGENTKERNEL_DATA_DIR=/var/lib/agentkernel
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/metrics || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    networks:
+      - agentkernel-net
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
+    depends_on:
+      agentkernel:
+        condition: service_healthy
+    networks:
+      - agentkernel-net
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=agentkernel
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - agentkernel-net
+
+volumes:
+  agentkernel_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  agentkernel-net:
+    driver: bridge

@@ -72,10 +72,7 @@ impl PtyStreamer {
     /// Broadcasts an output chunk to all active subscribers.
     /// Returns the number of active subscribers that received the message.
     pub fn broadcast(&self, chunk: PtyOutputChunk) -> usize {
-        match self.sender.send(chunk) {
-            Ok(count) => count,
-            Err(_) => 0, // No active subscribers is expected and valid
-        }
+        self.sender.send(chunk).unwrap_or_default()
     }
 
     /// Returns a reference to the internal broadcast sender.

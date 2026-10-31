@@ -115,11 +115,7 @@ pub fn build_dns_response(query: &DnsQuery, ips: &[IpAddr], ttl: u32) -> Vec<u8>
     // Filter IPs matching requested record type
     let matching_ips: Vec<&IpAddr> = ips
         .iter()
-        .filter(|ip| match (query.qtype, ip) {
-            (DnsRecordType::A, IpAddr::V4(_)) => true,
-            (DnsRecordType::AAAA, IpAddr::V6(_)) => true,
-            _ => false,
-        })
+        .filter(|ip| matches!((query.qtype, ip), (DnsRecordType::A, IpAddr::V4(_)) | (DnsRecordType::AAAA, IpAddr::V6(_))))
         .collect();
 
     // 1. Header (12 bytes)

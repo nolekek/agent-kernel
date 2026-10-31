@@ -1,3 +1,4 @@
+use crate::metrics::MetricsRegistry;
 use crate::sandbox::{DefaultSandboxSession, LeasedSandboxSession, SandboxConfig, SandboxSession};
 use crate::CoreError;
 use agentkernel_fs::StorageEngine;
@@ -67,6 +68,7 @@ pub struct WarmPool {
     warm_queue: Arc<Mutex<VecDeque<Arc<DefaultSandboxSession>>>>,
     leased_sandboxes: Arc<RwLock<HashMap<String, Arc<LeasedSandboxSession>>>>,
     is_closed: Arc<AtomicBool>,
+    metrics: Arc<MetricsRegistry>,
 }
 
 impl WarmPool {
@@ -76,6 +78,22 @@ impl WarmPool {
         storage_engine: Arc<dyn StorageEngine>,
         runtime_driver: Arc<dyn RuntimeDriver>,
     ) -> Arc<Self> {
+        Self::with_metrics(
+            config,
+            storage_engine,
+            runtime_driver,
+            Arc::new(MetricsRegistry::new()),
+        )
+        .await
+    }
+
+    /// Creates and initializes the WarmPool with a shared MetricsRegistry.
+    pub async fn with_metrics(
+        config: PoolConfig,
+        storage_engine: Arc<dyn StorageEngine>,
+        runtime_driver: Arc<dyn RuntimeDriver>,
+        metrics: Arc<MetricsRegistry>,
+    ) -> Arc<Self> {
         let pool = Arc::new(Self {
             config,
             storage_engine,
@@ -83,6 +101,7 @@ impl WarmPool {
             warm_queue: Arc::new(Mutex::new(VecDeque::new())),
             leased_sandboxes: Arc::new(RwLock::new(HashMap::new())),
             is_closed: Arc::new(AtomicBool::new(false)),
+            metrics,
         });
 
         // Initial pre-warm up to target_warm_count
@@ -104,6 +123,10 @@ impl WarmPool {
         });
 
         pool
+    }
+
+    pub fn metrics(&self) -> &Arc<MetricsRegistry> {
+        &self.metrics
     }
 
     /// Synchronously replenishes the pool up to the configured target_warm_count.
@@ -131,6 +154,11 @@ impl WarmPool {
                 }
             }
         }
+        let warm_cnt = queue.len();
+        self.metrics.sandboxes_warm.set(warm_cnt as i64);
+        let leased_cnt = self.leased_sandboxes.read().await.len();
+        self.metrics.sandboxes_total.set((warm_cnt + leased_cnt) as i64);
+
         info!(
             current_warm = queue.len(),
             target = self.config.target_warm_count,
@@ -217,10 +245,12 @@ impl PoolManager for WarmPool {
         let inner_session = match warm_session {
             Some(s) => {
                 s.lease(config.clone()).await?;
+                self.metrics.warm_boot_total.inc();
                 s
             }
             None => {
                 // Create a fresh session on demand
+                let timer = self.metrics.cold_boot_duration_seconds.start_timer();
                 let s = DefaultSandboxSession::create_warm(
                     config.clone(),
                     self.storage_engine.clone(),
@@ -228,6 +258,8 @@ impl PoolManager for WarmPool {
                 )
                 .await?;
                 s.lease(config.clone()).await?;
+                drop(timer);
+                self.metrics.cold_boot_total.inc();
                 Arc::new(s)
             }
         };
@@ -240,12 +272,21 @@ impl PoolManager for WarmPool {
             .await
             .insert(session_id.clone(), leased_session.clone());
 
+        // Update gauges
+        let warm_cnt = self.warm_queue.lock().await.len();
+        let leased_cnt = self.leased_sandboxes.read().await.len();
+        self.metrics.sandboxes_warm.set(warm_cnt as i64);
+        self.metrics.sandboxes_leased.set(leased_cnt as i64);
+        self.metrics.sandboxes_total.set((warm_cnt + leased_cnt) as i64);
+
         // Background replenishment to keep pool at target_warm_count
         let pool_self = self.warm_queue.clone();
         let target = self.config.target_warm_count;
         let storage = self.storage_engine.clone();
         let runtime = self.runtime_driver.clone();
         let closed = self.is_closed.clone();
+        let metrics = self.metrics.clone();
+        let leased_ref = self.leased_sandboxes.clone();
 
         tokio::spawn(async move {
             let mut queue = pool_self.lock().await;
@@ -260,6 +301,10 @@ impl PoolManager for WarmPool {
                     break;
                 }
             }
+            let w = queue.len();
+            let l = leased_ref.read().await.len();
+            metrics.sandboxes_warm.set(w as i64);
+            metrics.sandboxes_total.set((w + l) as i64);
         });
 
         info!(session_id = %session_id, "Sandbox successfully leased from pool");
@@ -275,6 +320,11 @@ impl PoolManager for WarmPool {
         match session {
             Some(s) => {
                 s.terminate().await?;
+                let warm_cnt = self.warm_queue.lock().await.len();
+                let leased_cnt = self.leased_sandboxes.read().await.len();
+                self.metrics.sandboxes_warm.set(warm_cnt as i64);
+                self.metrics.sandboxes_leased.set(leased_cnt as i64);
+                self.metrics.sandboxes_total.set((warm_cnt + leased_cnt) as i64);
                 info!(session_id = %session_id, "Sandbox released and terminated");
                 Ok(())
             }

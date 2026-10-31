@@ -94,19 +94,19 @@ flowchart TD
 ## 🚀 Дорожная карта разработки (Milestones)
 
 ### Этап 1: Локальное ядро изоляции (MVP, 2 недели)
-- [ ] Прототип изоляции процессов (namespaces + cgroups на Linux, JobObjects на Windows).
-- [ ] Виртуальный рабочий каталог с базовым механизмом CoW (OverlayFS/Hardlinks).
-- [ ] Базовый CLI-демон `agentkernel start / exec / stop`.
+- [x] Прототип изоляции процессов (namespaces + cgroups на Linux, JobObjects на Windows).
+- [x] Виртуальный рабочий каталог с базовым механизмом CoW (OverlayFS/Hardlinks).
+- [x] Базовый CLI-демон `agentkernel start / exec / stop`.
 
 ### Этап 2: PTY Стример и MCP-сервер (3-4 недели)
-- [ ] Потоковый PTY мультиплексор (интерактивный ввод/вывод команд, цветовые ANSI-коды).
-- [ ] Полноценный MCP-сервер по спецификации Model Context Protocol (JSON-RPC over stdio / SSE).
-- [ ] Движок снимков `checkpoint / rollback`.
+- [x] Потоковый PTY мультиплексор (интерактивный ввод/вывод команд, цветовые ANSI-коды).
+- [x] Полноценный MCP-сервер по спецификации Model Context Protocol (JSON-RPC over stdio / SSE).
+- [x] Движок снимков `checkpoint / rollback`.
 
 ### Этап 3: Сетевой файрвол и Cloud Multi-tenancy (5-8 недель)
-- [ ] Egress DNS-прокси с белыми списками.
-- [ ] REST/gRPC API управления пулом песочниц для многопользовательского режима.
-- [ ] Prometheus метрики: задержки cold-boot, потребление CPU/RAM, дисковые операции.
+- [x] Egress DNS-прокси с белыми списками.
+- [x] REST/gRPC API управления пулом песочниц для многопользовательского режима.
+- [x] Prometheus метрики: задержки cold-boot, потребление CPU/RAM, дисковые операции.
 
 ---
 

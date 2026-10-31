@@ -15,6 +15,7 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxConfig {
     pub session_id: String,
+    pub tenant_id: Option<String>,
     pub workspace_path: String,
     pub base_rootfs: Option<String>,
     pub env_vars: Vec<(String, String)>,
@@ -25,6 +26,7 @@ impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
             session_id: format!("sb_{}", Uuid::new_v4().simple()),
+            tenant_id: None,
             workspace_path: String::new(),
             base_rootfs: None,
             env_vars: Vec::new(),
@@ -39,6 +41,11 @@ impl SandboxConfig {
             session_id: session_id.into(),
             ..Default::default()
         }
+    }
+
+    pub fn with_tenant<S: Into<String>>(mut self, tenant_id: S) -> Self {
+        self.tenant_id = Some(tenant_id.into());
+        self
     }
 
     pub fn with_workspace<P: Into<String>>(mut self, path: P) -> Self {

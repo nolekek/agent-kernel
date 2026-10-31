@@ -1,41 +1,64 @@
 //! AgentKernel CLI: Command-Line Interface for Micro-Sandbox & MCP Server.
 
+pub mod daemon;
+pub mod tenant;
+
 use agentkernel_core::pool::PoolManager;
 use agentkernel_core::sandbox::SandboxConfig;
 use agentkernel_mcp::local_pool::LocalPoolManager;
 use agentkernel_mcp::server::AgentKernelMcpServer;
 use clap::{Parser, Subcommand};
+use daemon::{run_daemon, DaemonOptions};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tempfile::tempdir;
+use tenant::{handle_tenant_add, handle_tenant_list};
 use tracing::info;
 use uuid::Uuid;
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(name = "agentkernel")]
 #[command(about = "High-Performance Ephemeral Micro-Sandbox Runtime & MCP Server", version, long_about = None)]
-struct Cli {
+pub struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    pub command: Commands,
 }
 
-#[derive(Subcommand)]
-enum Commands {
+#[derive(Subcommand, Debug, PartialEq, Eq)]
+pub enum Commands {
     /// Start the Model Context Protocol (MCP) server over stdio
     Mcp {
         /// Number of pre-warmed sandbox isolates to maintain in pool
         #[arg(short, long, default_value = "3")]
         warm_pool_size: usize,
     },
-    /// Start the MCP server daemon over HTTP/SSE
+    /// Start the AgentKernel micro-sandbox & MCP server daemon over HTTP/SSE
     Daemon {
         /// Socket address to listen on
         #[arg(short, long, default_value = "127.0.0.1:8080")]
         addr: String,
 
+        /// Global Bearer token for single-tenant / monopoly usage
+        #[arg(long)]
+        auth_token: Option<String>,
+
+        /// Path to JSON file containing list of tenants and quotas
+        #[arg(long)]
+        tenants_file: Option<PathBuf>,
+
+        /// HTTP path where Prometheus metrics are exposed
+        #[arg(long, default_value = "/metrics")]
+        metrics_path: String,
+
         /// Number of pre-warmed sandbox isolates
         #[arg(short, long, default_value = "3")]
         warm_pool_size: usize,
+    },
+    /// Manage multi-tenant registries and sandbox quotas
+    Tenant {
+        #[command(subcommand)]
+        command: TenantCommands,
     },
     /// Run a command inside an ephemeral micro-sandbox
     Exec {
@@ -84,8 +107,40 @@ enum Commands {
     },
 }
 
-#[derive(Subcommand)]
-enum SnapshotCommands {
+#[derive(Subcommand, Debug, PartialEq, Eq)]
+pub enum TenantCommands {
+    /// List registered tenants and their quotas
+    List {
+        /// Path to tenants JSON file
+        #[arg(long)]
+        tenants_file: PathBuf,
+    },
+    /// Register or update a tenant configuration
+    Add {
+        /// Path to tenants JSON file
+        #[arg(long)]
+        tenants_file: PathBuf,
+
+        /// Unique tenant identifier
+        #[arg(long)]
+        id: String,
+
+        /// Tenant organization name
+        #[arg(long)]
+        name: String,
+
+        /// Secret API key for authentication
+        #[arg(long)]
+        api_key: String,
+
+        /// Maximum number of concurrent sandboxes
+        #[arg(long)]
+        max_sandboxes: usize,
+    },
+}
+
+#[derive(Subcommand, Debug, PartialEq, Eq)]
+pub enum SnapshotCommands {
     /// List all checkpoints/snapshots for a sandbox session
     List {
         /// Session ID of the sandbox
@@ -134,14 +189,43 @@ async fn main() -> anyhow::Result<()> {
             server.run_stdio().await?;
         }
 
-        Commands::Daemon { addr, warm_pool_size } => {
-            info!("Starting AgentKernel MCP daemon on http://{addr} (warm pool size: {warm_pool_size})...");
-            let pool = Arc::new(LocalPoolManager::new(warm_pool_size));
-            let server = AgentKernelMcpServer::new(pool);
-            server.run_http_sse(&addr).await?;
+        Commands::Daemon {
+            addr,
+            auth_token,
+            tenants_file,
+            metrics_path,
+            warm_pool_size,
+        } => {
+            let options = DaemonOptions {
+                addr,
+                auth_token,
+                tenants_file,
+                metrics_path,
+                warm_pool_size,
+            };
+            run_daemon(options).await?;
         }
 
-        Commands::Exec { workspace, timeout_ms, command } => {
+        Commands::Tenant { command } => match command {
+            TenantCommands::List { tenants_file } => {
+                handle_tenant_list(&tenants_file)?;
+            }
+            TenantCommands::Add {
+                tenants_file,
+                id,
+                name,
+                api_key,
+                max_sandboxes,
+            } => {
+                handle_tenant_add(&tenants_file, &id, &name, &api_key, max_sandboxes)?;
+            }
+        },
+
+        Commands::Exec {
+            workspace,
+            timeout_ms,
+            command,
+        } => {
             if command.is_empty() {
                 anyhow::bail!("No command specified to execute");
             }
@@ -151,6 +235,7 @@ async fn main() -> anyhow::Result<()> {
 
             let config = SandboxConfig {
                 session_id: session_id.clone(),
+                tenant_id: None,
                 workspace_path: workspace.clone(),
                 base_rootfs: None,
                 env_vars: vec![],
@@ -158,14 +243,18 @@ async fn main() -> anyhow::Result<()> {
             };
 
             info!("Leasing sandbox for workspace: {workspace}...");
-            let session = pool.acquire_sandbox(config).await
+            let session = pool
+                .acquire_sandbox(config)
+                .await
                 .map_err(|e| anyhow::anyhow!("Sandbox acquisition failed: {e}"))?;
 
             let cmd = &command[0];
             let args = &command[1..];
 
             info!("Executing command: {cmd} {args:?} (timeout: {timeout_ms}ms)...");
-            let output = session.exec(cmd, args, timeout_ms).await
+            let output = session
+                .exec(cmd, args, timeout_ms)
+                .await
                 .map_err(|e| anyhow::anyhow!("Command execution error: {e}"))?;
 
             if !output.stdout.is_empty() {
@@ -191,7 +280,12 @@ async fn main() -> anyhow::Result<()> {
             SnapshotCommands::List { session_id, server } => {
                 handle_snapshot_list(&session_id, &server).await?;
             }
-            SnapshotCommands::Diff { session_id, from, to, server } => {
+            SnapshotCommands::Diff {
+                session_id,
+                from,
+                to,
+                server,
+            } => {
                 handle_snapshot_diff(&session_id, from.as_deref(), to.as_deref(), &server).await?;
             }
         },
@@ -216,7 +310,9 @@ async fn handle_snapshot_list(session_id: &str, server: &str) -> anyhow::Result<
     let args = serde_json::json!({ "session_id": session_id });
     let val = call_mcp_tool(server, "sandbox_list_checkpoints", args).await?;
 
-    let checkpoints = val.as_array().ok_or_else(|| anyhow::anyhow!("Expected array of checkpoints"))?;
+    let checkpoints = val
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("Expected array of checkpoints"))?;
     if checkpoints.is_empty() {
         println!("No checkpoints found for sandbox session '{session_id}'.");
         return Ok(());
@@ -335,7 +431,8 @@ async fn handle_shell(workspace: &str, custom_shell: Option<&str>) -> anyhow::Re
         .stderr(std::process::Stdio::inherit())
         .env("AGENTKERNEL_WORKSPACE", workspace);
 
-    let mut child = process_cmd.spawn()
+    let mut child = process_cmd
+        .spawn()
         .map_err(|e| anyhow::anyhow!("Failed to launch shell '{shell_cmd}': {e}"))?;
 
     let exit_status = child.wait()?;
@@ -431,7 +528,9 @@ async fn call_mcp_tool(
                 let workspace = std::path::PathBuf::from(&meta.workspace_path);
 
                 let from_dir = if let Some(from_id) = from_cp_id {
-                    meta.checkpoints.iter().find(|c| c.id == from_id || c.name == from_id)
+                    meta.checkpoints
+                        .iter()
+                        .find(|c| c.id == from_id || c.name == from_id)
                         .map(|c| c.upperdir_path.clone())
                         .unwrap_or_else(|| workspace.join(".agentkernel").join("checkpoints").join(from_id))
                 } else if let Some(last_cp) = meta.checkpoints.last() {
@@ -441,7 +540,9 @@ async fn call_mcp_tool(
                 };
 
                 let to_dir = if let Some(to_id) = to_cp_id {
-                    meta.checkpoints.iter().find(|c| c.id == to_id || c.name == to_id)
+                    meta.checkpoints
+                        .iter()
+                        .find(|c| c.id == to_id || c.name == to_id)
                         .map(|c| c.upperdir_path.clone())
                         .unwrap_or_else(|| workspace.join(".agentkernel").join("checkpoints").join(to_id))
                 } else {
@@ -522,6 +623,7 @@ async fn run_benchmark(iterations: usize) -> anyhow::Result<()> {
         let session_id_warm = format!("bench-warm-{i}");
         let config_warm = SandboxConfig {
             session_id: session_id_warm.clone(),
+            tenant_id: None,
             workspace_path: workspace.clone(),
             base_rootfs: None,
             env_vars: vec![],
@@ -529,13 +631,17 @@ async fn run_benchmark(iterations: usize) -> anyhow::Result<()> {
         };
 
         let t0 = Instant::now();
-        let session_warm = pool.acquire_sandbox(config_warm).await
+        let session_warm = pool
+            .acquire_sandbox(config_warm)
+            .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         warm_boot_times.push(t0.elapsed().as_micros() as f64 / 1000.0);
 
         // 2. Command Exec Test
         let t1 = Instant::now();
-        let _ = session_warm.exec(cmd, &args, 5000).await
+        let _ = session_warm
+            .exec(cmd, &args, 5000)
+            .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         exec_times.push(t1.elapsed().as_micros() as f64 / 1000.0);
 
@@ -544,7 +650,9 @@ async fn run_benchmark(iterations: usize) -> anyhow::Result<()> {
         tokio::fs::write(&dummy_file, format!("bench iteration {i} data payload\n")).await?;
 
         let t2 = Instant::now();
-        let cp = session_warm.create_checkpoint(&format!("cp-{i}")).await
+        let cp = session_warm
+            .create_checkpoint(&format!("cp-{i}"))
+            .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         checkpoint_times.push(t2.elapsed().as_micros() as f64 / 1000.0);
 
@@ -553,7 +661,9 @@ async fn run_benchmark(iterations: usize) -> anyhow::Result<()> {
 
         // 4. Snapshot Rollback Test
         let t3 = Instant::now();
-        session_warm.rollback(&cp.id).await
+        session_warm
+            .rollback(&cp.id)
+            .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         rollback_times.push(t3.elapsed().as_micros() as f64 / 1000.0);
 
@@ -564,6 +674,7 @@ async fn run_benchmark(iterations: usize) -> anyhow::Result<()> {
         let session_id_cold = format!("bench-cold-{i}");
         let config_cold = SandboxConfig {
             session_id: session_id_cold.clone(),
+            tenant_id: None,
             workspace_path: workspace.clone(),
             base_rootfs: None,
             env_vars: vec![],
@@ -571,7 +682,9 @@ async fn run_benchmark(iterations: usize) -> anyhow::Result<()> {
         };
 
         let t4 = Instant::now();
-        let _session_cold = cold_pool.acquire_sandbox(config_cold).await
+        let _session_cold = cold_pool
+            .acquire_sandbox(config_cold)
+            .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
         cold_boot_times.push(t4.elapsed().as_micros() as f64 / 1000.0);
         let _ = cold_pool.release_sandbox(&session_id_cold).await;
@@ -602,6 +715,188 @@ fn print_metric_summary(name: &str, samples: &[f64], unit: &str) {
     let p95_idx = ((sorted.len() as f64 * 0.95).ceil() as usize).saturating_sub(1);
     let p95 = sorted.get(p95_idx).copied().unwrap_or(max);
 
-    println!("{:<24} | Avg: {:>7.3} {} | Min: {:>7.3} {} | P95: {:>7.3} {} | Max: {:>7.3} {}",
-        name, avg, unit, min, unit, p95, unit, max, unit);
+    println!(
+        "{:<24} | Avg: {:>7.3} {} | Min: {:>7.3} {} | P95: {:>7.3} {} | Max: {:>7.3} {}",
+        name, avg, unit, min, unit, p95, unit, max, unit
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_cli_parse_daemon_defaults() {
+        let cli = Cli::try_parse_from(["agentkernel", "daemon"]).expect("Failed to parse default daemon args");
+        match cli.command {
+            Commands::Daemon {
+                addr,
+                auth_token,
+                tenants_file,
+                metrics_path,
+                warm_pool_size,
+            } => {
+                assert_eq!(addr, "127.0.0.1:8080");
+                assert_eq!(auth_token, None);
+                assert_eq!(tenants_file, None);
+                assert_eq!(metrics_path, "/metrics");
+                assert_eq!(warm_pool_size, 3);
+            }
+            _ => panic!("Expected Daemon command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_daemon_custom_options() {
+        let cli = Cli::try_parse_from([
+            "agentkernel",
+            "daemon",
+            "--addr",
+            "0.0.0.0:9090",
+            "--auth-token",
+            "secret_token_123",
+            "--tenants-file",
+            "/etc/agentkernel/tenants.json",
+            "--metrics-path",
+            "/custom_metrics",
+            "--warm-pool-size",
+            "10",
+        ])
+        .expect("Failed to parse custom daemon args");
+
+        match cli.command {
+            Commands::Daemon {
+                addr,
+                auth_token,
+                tenants_file,
+                metrics_path,
+                warm_pool_size,
+            } => {
+                assert_eq!(addr, "0.0.0.0:9090");
+                assert_eq!(auth_token, Some("secret_token_123".to_string()));
+                assert_eq!(
+                    tenants_file,
+                    Some(PathBuf::from("/etc/agentkernel/tenants.json"))
+                );
+                assert_eq!(metrics_path, "/custom_metrics");
+                assert_eq!(warm_pool_size, 10);
+            }
+            _ => panic!("Expected Daemon command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_tenant_list() {
+        let cli = Cli::try_parse_from([
+            "agentkernel",
+            "tenant",
+            "list",
+            "--tenants-file",
+            "/tmp/tenants.json",
+        ])
+        .expect("Failed to parse tenant list args");
+
+        match cli.command {
+            Commands::Tenant {
+                command: TenantCommands::List { tenants_file },
+            } => {
+                assert_eq!(tenants_file, PathBuf::from("/tmp/tenants.json"));
+            }
+            _ => panic!("Expected Tenant List command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_tenant_add() {
+        let cli = Cli::try_parse_from([
+            "agentkernel",
+            "tenant",
+            "add",
+            "--tenants-file",
+            "/tmp/tenants.json",
+            "--id",
+            "tenant-acme",
+            "--name",
+            "Acme Corp",
+            "--api-key",
+            "ak_live_xyz",
+            "--max-sandboxes",
+            "8",
+        ])
+        .expect("Failed to parse tenant add args");
+
+        match cli.command {
+            Commands::Tenant {
+                command:
+                    TenantCommands::Add {
+                        tenants_file,
+                        id,
+                        name,
+                        api_key,
+                        max_sandboxes,
+                    },
+            } => {
+                assert_eq!(tenants_file, PathBuf::from("/tmp/tenants.json"));
+                assert_eq!(id, "tenant-acme");
+                assert_eq!(name, "Acme Corp");
+                assert_eq!(api_key, "ak_live_xyz");
+                assert_eq!(max_sandboxes, 8);
+            }
+            _ => panic!("Expected Tenant Add command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_mcp() {
+        let cli = Cli::try_parse_from(["agentkernel", "mcp", "--warm-pool-size", "5"])
+            .expect("Failed to parse mcp args");
+        match cli.command {
+            Commands::Mcp { warm_pool_size } => {
+                assert_eq!(warm_pool_size, 5);
+            }
+            _ => panic!("Expected Mcp command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_exec() {
+        let cli = Cli::try_parse_from([
+            "agentkernel",
+            "exec",
+            "--workspace",
+            "/tmp/ws",
+            "--timeout-ms",
+            "15000",
+            "--",
+            "ls",
+            "-la",
+        ])
+        .expect("Failed to parse exec args");
+
+        match cli.command {
+            Commands::Exec {
+                workspace,
+                timeout_ms,
+                command,
+            } => {
+                assert_eq!(workspace, "/tmp/ws");
+                assert_eq!(timeout_ms, 15000);
+                assert_eq!(command, vec!["ls", "-la"]);
+            }
+            _ => panic!("Expected Exec command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_parse_benchmark() {
+        let cli = Cli::try_parse_from(["agentkernel", "benchmark", "--iterations", "25"])
+            .expect("Failed to parse benchmark args");
+        match cli.command {
+            Commands::Benchmark { iterations } => {
+                assert_eq!(iterations, 25);
+            }
+            _ => panic!("Expected Benchmark command"),
+        }
+    }
 }

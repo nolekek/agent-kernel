@@ -71,6 +71,15 @@ impl JsonRpcError {
     pub const METHOD_NOT_FOUND: i32 = -32601;
     pub const INVALID_PARAMS: i32 = -32602;
     pub const INTERNAL_ERROR: i32 = -32603;
+    pub const UNAUTHORIZED: i32 = -32001;
+
+    pub fn unauthorized(msg: impl Into<String>) -> Self {
+        Self {
+            code: Self::UNAUTHORIZED,
+            message: msg.into(),
+            data: None,
+        }
+    }
 
     pub fn parse_error(msg: impl Into<String>) -> Self {
         Self {

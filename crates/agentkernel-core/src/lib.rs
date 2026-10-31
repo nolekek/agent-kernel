@@ -1,13 +1,17 @@
 //! AgentKernel Core: Sandbox Orchestrator, Warm Pool Manager & State Machine.
 
+pub mod metrics;
 pub mod pool;
 pub mod sandbox;
+pub mod tenant;
 
 pub use agentkernel_fs::{ChangeType, Checkpoint, CheckpointInfo, FileDiff, StorageUsage};
+pub use metrics::{Counter, Gauge, Histogram, HistogramTimer, MetricsRegistry, DEFAULT_BUCKETS};
 pub use pool::{PoolConfig, PoolManager, WarmPool};
 pub use sandbox::{
     DefaultSandboxSession, LeasedSandboxSession, SandboxConfig, SandboxMetrics, SandboxSession,
 };
+pub use tenant::{TenantConfig, TenantId, TenantManager};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -30,6 +34,10 @@ pub enum CoreError {
     InvalidState(String),
     #[error("Execution timed out")]
     Timeout,
+    #[error("Quota exceeded: {0}")]
+    QuotaExceeded(String),
+    #[error("Unauthorized: {0}")]
+    Unauthorized(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 }

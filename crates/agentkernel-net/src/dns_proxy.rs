@@ -53,11 +53,7 @@ impl DnsResolver for SystemResolver {
         let ips: Vec<IpAddr> = socket_addrs
             .into_iter()
             .map(|sa| sa.ip())
-            .filter(|ip| match (qtype, ip) {
-                (DnsRecordType::A, IpAddr::V4(_)) => true,
-                (DnsRecordType::AAAA, IpAddr::V6(_)) => true,
-                _ => false,
-            })
+            .filter(|ip| matches!((qtype, ip), (DnsRecordType::A, IpAddr::V4(_)) | (DnsRecordType::AAAA, IpAddr::V6(_))))
             .collect();
 
         if ips.is_empty() {
@@ -95,11 +91,7 @@ impl DnsResolver for MockResolver {
             let filtered: Vec<IpAddr> = ips
                 .iter()
                 .cloned()
-                .filter(|ip| match (qtype, ip) {
-                    (DnsRecordType::A, IpAddr::V4(_)) => true,
-                    (DnsRecordType::AAAA, IpAddr::V6(_)) => true,
-                    _ => false,
-                })
+                .filter(|ip| matches!((qtype, ip), (DnsRecordType::A, IpAddr::V4(_)) | (DnsRecordType::AAAA, IpAddr::V6(_))))
                 .collect();
 
             if filtered.is_empty() {

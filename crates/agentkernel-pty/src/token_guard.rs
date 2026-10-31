@@ -24,7 +24,7 @@ impl TokenGuard {
     /// and `tail` lines at the bottom with a truncation marker in between.
     /// If max_lines is 0, no line truncation occurs.
     pub fn new(max_lines: usize) -> Self {
-        let head = if max_lines > 0 { (max_lines + 1) / 2 } else { 0 };
+        let head = if max_lines > 0 { max_lines.div_ceil(2) } else { 0 };
         let tail = if max_lines > 0 { max_lines / 2 } else { 0 };
         Self {
             head_limit: head,

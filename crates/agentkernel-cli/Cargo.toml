@@ -12,6 +12,14 @@ path = "src/main.rs"
 name = "integration_test"
 path = "../../tests/integration_test.rs"
 
+[[test]]
+name = "multi_tenant_e2e_test"
+path = "../../tests/multi_tenant_e2e_test.rs"
+
+[[test]]
+name = "metrics_e2e_test"
+path = "../../tests/metrics_e2e_test.rs"
+
 [dependencies]
 agentkernel-core = { workspace = true }
 agentkernel-mcp = { workspace = true }
@@ -22,6 +30,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }

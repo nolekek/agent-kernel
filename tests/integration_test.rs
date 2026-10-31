@@ -23,6 +23,7 @@ async fn test_full_sandbox_lifecycle_direct() {
     // 2. Lease sandbox isolate
     let config = SandboxConfig {
         session_id: "test-session-1".to_string(),
+        tenant_id: None,
         workspace_path: workspace_path.clone(),
         base_rootfs: None,
         env_vars: vec![("AGENT_ENV".to_string(), "production".to_string())],

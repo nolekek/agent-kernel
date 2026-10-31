@@ -625,4 +625,302 @@ mod tests {
         assert!(found_output, "SSE stream must receive command output in real time");
         server_task.abort();
     }
+
+    #[tokio::test]
+    async fn test_http_authorization_validation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+
+        let server = Arc::new(AgentKernelMcpServer::with_local_pool(1));
+        let tenant_cfg = agentkernel_core::tenant::TenantConfig::new(
+            "tenant-auth-1",
+            "Auth Tenant",
+            "valid-secret-key-123",
+            2,
+        );
+        server.tenant_manager().register_tenant(tenant_cfg).await.unwrap();
+
+        let srv_clone = server.clone();
+        let addr_clone = server_addr.clone();
+        let server_task = tokio::spawn(async move {
+            let _ = srv_clone.run_http_sse(&addr_clone).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let post_body = serde_json::to_string(&JsonRpcRequest::new(
+            Some(json!(1)),
+            "tools/call",
+            Some(json!({
+                "name": "sandbox_acquire",
+                "arguments": { "workspace_path": std::env::temp_dir().to_string_lossy().to_string() }
+            })),
+        )).unwrap();
+
+        // 1. Missing Authorization Header -> 401 Unauthorized
+        {
+            let mut sock = tokio::net::TcpStream::connect(&server_addr).await.unwrap();
+            let req = format!(
+                "POST /message HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                server_addr, post_body.len(), post_body
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut sock, req.as_bytes()).await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await.unwrap();
+            let resp_str = String::from_utf8_lossy(&buf[..n]);
+            assert!(resp_str.contains("401 Unauthorized"), "Expected 401 for missing auth: {resp_str}");
+            assert!(resp_str.contains("-32001"), "Expected -32001 in body: {resp_str}");
+        }
+
+        // 2. Invalid Authorization Header -> 401 Unauthorized
+        {
+            let mut sock = tokio::net::TcpStream::connect(&server_addr).await.unwrap();
+            let req = format!(
+                "POST /message HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer wrong-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                server_addr, post_body.len(), post_body
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut sock, req.as_bytes()).await.unwrap();
+            let mut buf = vec![0u8; 1024];
+            let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await.unwrap();
+            let resp_str = String::from_utf8_lossy(&buf[..n]);
+            assert!(resp_str.contains("401 Unauthorized"), "Expected 401 for invalid token: {resp_str}");
+            assert!(resp_str.contains("-32001"), "Expected -32001 in body: {resp_str}");
+        }
+
+        // 3. Valid Authorization Header -> 200 OK
+        {
+            let mut sock = tokio::net::TcpStream::connect(&server_addr).await.unwrap();
+            let req = format!(
+                "POST /message HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer valid-secret-key-123\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                server_addr, post_body.len(), post_body
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut sock, req.as_bytes()).await.unwrap();
+            let mut buf = vec![0u8; 2048];
+            let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await.unwrap();
+            let resp_str = String::from_utf8_lossy(&buf[..n]);
+            assert!(resp_str.contains("200 OK"), "Expected 200 OK for valid token: {resp_str}");
+            assert!(resp_str.contains("leased"), "Expected leased status in result: {resp_str}");
+        }
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_tenant_isolation_mcp() {
+        let server = AgentKernelMcpServer::with_local_pool(2);
+        let tid_a = agentkernel_core::tenant::TenantId::new("tenant-a");
+        let tid_b = agentkernel_core::tenant::TenantId::new("tenant-b");
+
+        server.tenant_manager().register_tenant(agentkernel_core::tenant::TenantConfig::new(
+            tid_a.clone(),
+            "Tenant A",
+            "key-aaa",
+            3,
+        )).await.unwrap();
+
+        server.tenant_manager().register_tenant(agentkernel_core::tenant::TenantConfig::new(
+            tid_b.clone(),
+            "Tenant B",
+            "key-bbb",
+            3,
+        )).await.unwrap();
+
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path().to_str().unwrap().to_string();
+
+        // 1. Tenant A acquires a sandbox
+        let acq_req = JsonRpcRequest::new(
+            Some(json!(1)),
+            "tools/call",
+            Some(json!({
+                "api_key": "key-aaa",
+                "name": "sandbox_acquire",
+                "arguments": { "workspace_path": ws }
+            })),
+        );
+        let acq_resp = server.handle_request(acq_req).await;
+        let acq_res = acq_resp.result.expect("Acquire should succeed");
+        let txt = acq_res["content"][0]["text"].as_str().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(txt).unwrap();
+        let session_id = parsed["session_id"].as_str().unwrap().to_string();
+
+        // 2. Tenant B tries to execute a command on Tenant A's sandbox -> Unauthorized
+        let exec_b = JsonRpcRequest::new(
+            Some(json!(2)),
+            "tools/call",
+            Some(json!({
+                "api_key": "key-bbb",
+                "name": "sandbox_exec",
+                "arguments": {
+                    "session_id": session_id.clone(),
+                    "cmd": "echo",
+                    "args": ["hi"]
+                }
+            })),
+        );
+        let exec_b_resp = server.handle_request(exec_b).await;
+        let exec_b_res = exec_b_resp.result.unwrap();
+        assert_eq!(exec_b_res["isError"], true);
+        assert!(exec_b_res["content"][0]["text"].as_str().unwrap().contains("Unauthorized"));
+
+        // 3. Tenant B tries to rollback Tenant A's sandbox -> Unauthorized
+        let rb_b = JsonRpcRequest::new(
+            Some(json!(3)),
+            "tools/call",
+            Some(json!({
+                "api_key": "key-bbb",
+                "name": "sandbox_rollback",
+                "arguments": {
+                    "session_id": session_id.clone(),
+                    "checkpoint_id": "cp-dummy"
+                }
+            })),
+        );
+        let rb_b_resp = server.handle_request(rb_b).await;
+        let rb_b_res = rb_b_resp.result.unwrap();
+        assert_eq!(rb_b_res["isError"], true);
+        assert!(rb_b_res["content"][0]["text"].as_str().unwrap().contains("Unauthorized"));
+
+        // 4. Tenant B tries to release Tenant A's sandbox -> Unauthorized
+        let rel_b = JsonRpcRequest::new(
+            Some(json!(4)),
+            "tools/call",
+            Some(json!({
+                "api_key": "key-bbb",
+                "name": "sandbox_release",
+                "arguments": {
+                    "session_id": session_id.clone()
+                }
+            })),
+        );
+        let rel_b_resp = server.handle_request(rel_b).await;
+        let rel_b_res = rel_b_resp.result.unwrap();
+        assert_eq!(rel_b_res["isError"], true);
+        assert!(rel_b_res["content"][0]["text"].as_str().unwrap().contains("Unauthorized"));
+
+        // 5. Tenant A releases sandbox -> Success
+        let rel_a = JsonRpcRequest::new(
+            Some(json!(5)),
+            "tools/call",
+            Some(json!({
+                "api_key": "key-aaa",
+                "name": "sandbox_release",
+                "arguments": {
+                    "session_id": session_id.clone()
+                }
+            })),
+        );
+        let rel_a_resp = server.handle_request(rel_a).await;
+        let rel_a_res = rel_a_resp.result.unwrap();
+        assert_eq!(rel_a_res["isError"], json!(null));
+    }
+
+    #[tokio::test]
+    async fn test_http_metrics_endpoint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+
+        let server = Arc::new(AgentKernelMcpServer::with_local_pool(2));
+        server.metrics().commands_total.inc_by(7);
+        server.metrics().quota_violations_total.inc_by(2);
+
+        let srv_clone = server.clone();
+        let addr_clone = server_addr.clone();
+        let server_task = tokio::spawn(async move {
+            let _ = srv_clone.run_http_sse(&addr_clone).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let mut sock = tokio::net::TcpStream::connect(&server_addr).await.unwrap();
+        let req = format!("GET /metrics HTTP/1.1\r\nHost: {}\r\n\r\n", server_addr);
+        tokio::io::AsyncWriteExt::write_all(&mut sock, req.as_bytes()).await.unwrap();
+
+        let mut buf = vec![0u8; 4096];
+        let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&buf[..n]);
+
+        assert!(resp_str.contains("HTTP/1.1 200 OK"), "Expected 200 OK: {resp_str}");
+        assert!(resp_str.contains("Content-Type: text/plain; version=0.0.4"), "Expected prometheus content type: {resp_str}");
+        assert!(resp_str.contains("# HELP agentkernel_sandboxes_warm"), "Missing warm gauge: {resp_str}");
+        assert!(resp_str.contains("# TYPE agentkernel_sandboxes_warm gauge"), "Missing gauge type: {resp_str}");
+        assert!(resp_str.contains("agentkernel_commands_total 7"), "Missing commands count: {resp_str}");
+        assert!(resp_str.contains("agentkernel_quota_violations_total 2"), "Missing quota violations count: {resp_str}");
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_tenant_quota_exceeded_mcp() {
+        let server = AgentKernelMcpServer::with_local_pool(2);
+        let tid = agentkernel_core::tenant::TenantId::new("quota-tenant");
+
+        server.tenant_manager().register_tenant(agentkernel_core::tenant::TenantConfig::new(
+            tid.clone(),
+            "Quota Tenant",
+            "key-quota",
+            1, // Only 1 concurrent sandbox allowed!
+        )).await.unwrap();
+
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path().to_str().unwrap().to_string();
+
+        // 1. First sandbox acquire -> OK
+        let acq1 = server.handle_request(JsonRpcRequest::new(
+            Some(json!(1)),
+            "tools/call",
+            Some(json!({
+                "api_key": "key-quota",
+                "name": "sandbox_acquire",
+                "arguments": { "workspace_path": ws }
+            })),
+        )).await;
+        let acq1_res = acq1.result.unwrap();
+        assert_eq!(acq1_res["isError"], json!(null));
+        let session1_id = serde_json::from_str::<serde_json::Value>(acq1_res["content"][0]["text"].as_str().unwrap())
+            .unwrap()["session_id"].as_str().unwrap().to_string();
+
+        // 2. Second sandbox acquire -> Quota exceeded!
+        let acq2 = server.handle_request(JsonRpcRequest::new(
+            Some(json!(2)),
+            "tools/call",
+            Some(json!({
+                "api_key": "key-quota",
+                "name": "sandbox_acquire",
+                "arguments": { "workspace_path": ws }
+            })),
+        )).await;
+        let acq2_res = acq2.result.unwrap();
+        assert_eq!(acq2_res["isError"], true);
+        assert!(acq2_res["content"][0]["text"].as_str().unwrap().contains("Quota exceeded"));
+
+        // Verify quota violation metric
+        assert_eq!(server.metrics().quota_violations_total.get(), 1);
+
+        // 3. Release first sandbox
+        server.handle_request(JsonRpcRequest::new(
+            Some(json!(3)),
+            "tools/call",
+            Some(json!({
+                "api_key": "key-quota",
+                "name": "sandbox_release",
+                "arguments": { "session_id": session1_id }
+            })),
+        )).await;
+
+        // 4. Now second sandbox acquire -> OK
+        let acq3 = server.handle_request(JsonRpcRequest::new(
+            Some(json!(4)),
+            "tools/call",
+            Some(json!({
+                "api_key": "key-quota",
+                "name": "sandbox_acquire",
+                "arguments": { "workspace_path": ws }
+            })),
+        )).await;
+        let acq3_res = acq3.result.unwrap();
+        assert_eq!(acq3_res["isError"], json!(null));
+    }
 }

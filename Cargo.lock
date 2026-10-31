@@ -13,6 +13,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

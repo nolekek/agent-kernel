@@ -49,8 +49,7 @@ impl EgressPolicy {
             }
 
             // Wildcard prefix: *.example.com
-            if pattern.starts_with("*.") {
-                let suffix = &pattern[2..];
+            if let Some(suffix) = pattern.strip_prefix("*.") {
                 if normalized == suffix || normalized.ends_with(&format!(".{}", suffix)) {
                     return true;
                 }
