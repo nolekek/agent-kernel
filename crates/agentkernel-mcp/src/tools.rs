@@ -163,6 +163,56 @@ pub fn mcp_tools_list() -> Vec<Tool> {
                 "required": ["session_id"]
             }),
         },
+        Tool {
+            name: "sandbox_diff".to_string(),
+            description: "Inspect modified files and unified diff between checkpoints or current workspace.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID of the leased sandbox"
+                    },
+                    "from_checkpoint": {
+                        "type": "string",
+                        "description": "Optional base checkpoint ID to compare from"
+                    },
+                    "to_checkpoint": {
+                        "type": "string",
+                        "description": "Optional target checkpoint ID to compare to (defaults to current workspace)"
+                    }
+                },
+                "required": ["session_id"]
+            }),
+        },
+        Tool {
+            name: "sandbox_list_checkpoints".to_string(),
+            description: "List all checkpoints/snapshots for a sandbox session with metadata and size in bytes.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID of the leased sandbox"
+                    }
+                },
+                "required": ["session_id"]
+            }),
+        },
+        Tool {
+            name: "sandbox_metrics".to_string(),
+            description: "Retrieve current sandbox isolate resource and performance metrics.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "Session ID of the leased sandbox"
+                    }
+                },
+                "required": ["session_id"]
+            }),
+        },
     ]
 }
 
@@ -202,7 +252,7 @@ mod tests {
     #[test]
     fn test_tools_list_completeness() {
         let tools = mcp_tools_list();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 10);
         let names: Vec<String> = tools.into_iter().map(|t| t.name).collect();
         assert!(names.contains(&"sandbox_acquire".to_string()));
         assert!(names.contains(&"sandbox_exec".to_string()));
@@ -211,6 +261,9 @@ mod tests {
         assert!(names.contains(&"sandbox_create_checkpoint".to_string()));
         assert!(names.contains(&"sandbox_rollback".to_string()));
         assert!(names.contains(&"sandbox_release".to_string()));
+        assert!(names.contains(&"sandbox_diff".to_string()));
+        assert!(names.contains(&"sandbox_list_checkpoints".to_string()));
+        assert!(names.contains(&"sandbox_metrics".to_string()));
     }
 
     #[test]

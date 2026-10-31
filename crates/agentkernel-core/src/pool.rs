@@ -50,6 +50,13 @@ pub trait PoolManager: Send + Sync {
     async fn acquire_sandbox(&self, config: SandboxConfig) -> Result<Arc<dyn SandboxSession>, CoreError>;
     async fn release_sandbox(&self, session_id: &str) -> Result<(), CoreError>;
     async fn warm_count(&self) -> usize;
+    async fn leased_count(&self) -> usize {
+        0
+    }
+    async fn get_session(&self, session_id: &str) -> Result<Arc<dyn SandboxSession>, CoreError> {
+        let _ = session_id;
+        Err(CoreError::NotFound(session_id.to_string()))
+    }
 }
 
 /// Thread-safe Pre-warmed Sandbox Pool with background replenishment and TTL eviction.
@@ -278,6 +285,18 @@ impl PoolManager for WarmPool {
     async fn warm_count(&self) -> usize {
         self.warm_queue.lock().await.len()
     }
+
+    async fn leased_count(&self) -> usize {
+        self.leased_sandboxes.read().await.len()
+    }
+
+    async fn get_session(&self, session_id: &str) -> Result<Arc<dyn SandboxSession>, CoreError> {
+        let leased = self.leased_sandboxes.read().await;
+        match leased.get(session_id) {
+            Some(s) => Ok(s.clone() as Arc<dyn SandboxSession>),
+            None => Err(CoreError::NotFound(session_id.to_string())),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -307,6 +326,11 @@ mod tests {
 
         assert_eq!(pool.leased_count().await, 1);
 
+        // Get session by ID
+        let retrieved = pool.get_session("agent_task_1").await;
+        assert!(retrieved.is_ok());
+        assert_eq!(retrieved.unwrap().id(), "agent_task_1");
+
         // Wait for background replenishment with polling
         let mut replenished = false;
         for _ in 0..20 {
@@ -321,6 +345,7 @@ mod tests {
         // Release sandbox
         pool.release_sandbox("agent_task_1").await.expect("release 1");
         assert_eq!(pool.leased_count().await, 0);
+        assert!(pool.get_session("agent_task_1").await.is_err());
 
         pool.shutdown().await;
     }

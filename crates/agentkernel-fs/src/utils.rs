@@ -1,5 +1,6 @@
-//! Filesystem Utilities: Recursive Copy, Directory Wipe & Layer Diffing.
+//! Filesystem Utilities: Recursive Copy, Directory Wipe, Layer Diffing & Metrics.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -42,6 +43,113 @@ pub fn wipe_dir_contents(dir: &Path) -> io::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Computes the total byte size of all files under `path` recursively.
+pub fn dir_size(path: &Path) -> io::Result<u64> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    if path.is_file() {
+        return Ok(path.metadata()?.len());
+    }
+    let mut total = 0;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            total += dir_size(&entry.path())?;
+        } else if ft.is_file() {
+            total += entry.metadata()?.len();
+        }
+    }
+    Ok(total)
+}
+
+/// Recursively scans `dir` and returns a map of normalized relative paths to file contents.
+/// Files matching any of `ignore_prefixes` are excluded.
+pub fn collect_files(
+    dir: &Path,
+    ignore_prefixes: &[&str],
+) -> io::Result<HashMap<String, Vec<u8>>> {
+    let mut map = HashMap::new();
+    if !dir.exists() {
+        return Ok(map);
+    }
+    collect_files_recursive(dir, dir, ignore_prefixes, &mut map)?;
+    Ok(map)
+}
+
+fn collect_files_recursive(
+    root: &Path,
+    current: &Path,
+    ignore_prefixes: &[&str],
+    out: &mut HashMap<String, Vec<u8>>,
+) -> io::Result<()> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let rel_path = path.strip_prefix(root).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
+        })?;
+        let rel_str = rel_path.to_string_lossy().replace('\\', "/");
+
+        if ignore_prefixes.iter().any(|prefix| rel_str.starts_with(prefix) || rel_str.contains(prefix)) {
+            continue;
+        }
+
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            collect_files_recursive(root, &path, ignore_prefixes, out)?;
+        } else if ft.is_file() {
+            let content = fs::read(&path)?;
+            out.insert(rel_str, content);
+        }
+    }
+    Ok(())
+}
+
+/// Finds all files that exist in `lower_dirs` but are missing in `current`.
+pub fn find_deleted_relative_to_lowers(
+    current: &Path,
+    lower_dirs: &[PathBuf],
+) -> io::Result<Vec<String>> {
+    let mut deleted = Vec::new();
+    for lower in lower_dirs {
+        if !lower.exists() {
+            continue;
+        }
+        find_deleted_recursive(lower, lower, current, &mut deleted)?;
+    }
+    deleted.sort();
+    deleted.dedup();
+    Ok(deleted)
+}
+
+fn find_deleted_recursive(
+    lower_root: &Path,
+    current_lower: &Path,
+    current_mount: &Path,
+    deleted: &mut Vec<String>,
+) -> io::Result<()> {
+    for entry in fs::read_dir(current_lower)? {
+        let entry = entry?;
+        let path = entry.path();
+        let rel_path = path.strip_prefix(lower_root).map_err(|e| {
+            io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
+        })?;
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            find_deleted_recursive(lower_root, &path, current_mount, deleted)?;
+        } else if ft.is_file() {
+            let in_mount = current_mount.join(rel_path);
+            if !in_mount.exists() {
+                let rel_str = rel_path.to_string_lossy().replace('\\', "/");
+                deleted.push(rel_str);
+            }
+        }
+    }
     Ok(())
 }
 

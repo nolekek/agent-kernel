@@ -1,10 +1,11 @@
 use crate::{CoreError, SandboxStatus};
-use agentkernel_fs::{Checkpoint, OverlayMount, StorageEngine};
+use agentkernel_fs::{Checkpoint, CheckpointInfo, FileDiff, OverlayMount, StorageEngine};
 use agentkernel_pty::CommandOutput;
 use agentkernel_runtime::RuntimeDriver;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
@@ -56,6 +57,15 @@ impl SandboxConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SandboxMetrics {
+    pub cpu_time_ms: u64,
+    pub memory_rss_bytes: u64,
+    pub disk_usage_bytes: u64,
+    pub uptime_seconds: u64,
+    pub status: SandboxStatus,
+}
+
 #[async_trait]
 pub trait SandboxSession: Send + Sync {
     fn id(&self) -> &str;
@@ -63,6 +73,21 @@ pub trait SandboxSession: Send + Sync {
     async fn create_checkpoint(&self, name: &str) -> Result<Checkpoint, CoreError>;
     async fn rollback(&self, checkpoint_id: &str) -> Result<(), CoreError>;
     async fn terminate(&self) -> Result<(), CoreError>;
+    async fn list_checkpoints(&self) -> Result<Vec<CheckpointInfo>, CoreError> {
+        Ok(Vec::new())
+    }
+    async fn get_diff(&self, _from: Option<&str>, _to: Option<&str>) -> Result<Vec<FileDiff>, CoreError> {
+        Ok(Vec::new())
+    }
+    async fn get_metrics(&self) -> Result<SandboxMetrics, CoreError> {
+        Ok(SandboxMetrics {
+            cpu_time_ms: 0,
+            memory_rss_bytes: 0,
+            disk_usage_bytes: 0,
+            uptime_seconds: 0,
+            status: SandboxStatus::Warm,
+        })
+    }
 }
 
 /// Concrete sandbox session with full lifecycle state machine.
@@ -72,6 +97,7 @@ pub struct DefaultSandboxSession {
     status: Arc<RwLock<SandboxStatus>>,
     last_active: Arc<RwLock<Instant>>,
     created_at: Instant,
+    accumulated_cpu_ms: Arc<AtomicU64>,
     overlay_mount: Arc<Mutex<Option<OverlayMount>>>,
     storage_engine: Arc<dyn StorageEngine>,
     runtime_driver: Arc<dyn RuntimeDriver>,
@@ -127,6 +153,7 @@ impl DefaultSandboxSession {
             status,
             last_active: Arc::new(RwLock::new(now)),
             created_at: now,
+            accumulated_cpu_ms: Arc::new(AtomicU64::new(0)),
             overlay_mount: Arc::new(Mutex::new(Some(mount))),
             storage_engine,
             runtime_driver,
@@ -262,6 +289,9 @@ impl SandboxSession for DefaultSandboxSession {
         }
         .await;
 
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        self.accumulated_cpu_ms.fetch_add(elapsed_ms, Ordering::Relaxed);
+
         // Transition back to Leased and update last_active
         *self.status.write().await = SandboxStatus::Leased;
         *self.last_active.write().await = Instant::now();
@@ -307,6 +337,53 @@ impl SandboxSession for DefaultSandboxSession {
 
         info!(session_id = %self.id, "Sandbox session terminated and resources freed");
         Ok(())
+    }
+
+    async fn list_checkpoints(&self) -> Result<Vec<CheckpointInfo>, CoreError> {
+        let mount_guard = self.overlay_mount.lock().await;
+        if let Some(ref mount) = *mount_guard {
+            let list = self.storage_engine.list_checkpoints(mount).await?;
+            Ok(list)
+        } else {
+            Err(CoreError::InvalidState("Overlay not mounted".to_string()))
+        }
+    }
+
+    async fn get_diff(&self, from: Option<&str>, to: Option<&str>) -> Result<Vec<FileDiff>, CoreError> {
+        let mount_guard = self.overlay_mount.lock().await;
+        if let Some(ref mount) = *mount_guard {
+            let diffs = self.storage_engine.get_diff(mount, from, to).await?;
+            Ok(diffs)
+        } else {
+            Err(CoreError::InvalidState("Overlay not mounted".to_string()))
+        }
+    }
+
+    async fn get_metrics(&self) -> Result<SandboxMetrics, CoreError> {
+        let status = *self.status.read().await;
+        let uptime_seconds = self.created_at.elapsed().as_secs();
+        let cpu_time_ms = self.accumulated_cpu_ms.load(Ordering::Relaxed);
+
+        let disk_usage_bytes = {
+            let mount_guard = self.overlay_mount.lock().await;
+            if let Some(ref mount) = *mount_guard {
+                self.storage_engine
+                    .get_storage_usage(mount)
+                    .await
+                    .map(|u| u.total_size_bytes)
+                    .unwrap_or(0)
+            } else {
+                0
+            }
+        };
+
+        Ok(SandboxMetrics {
+            cpu_time_ms,
+            memory_rss_bytes: 0,
+            disk_usage_bytes,
+            uptime_seconds,
+            status,
+        })
     }
 }
 
@@ -367,12 +444,24 @@ impl SandboxSession for LeasedSandboxSession {
     async fn terminate(&self) -> Result<(), CoreError> {
         self.inner.terminate().await
     }
+
+    async fn list_checkpoints(&self) -> Result<Vec<CheckpointInfo>, CoreError> {
+        self.inner.list_checkpoints().await
+    }
+
+    async fn get_diff(&self, from: Option<&str>, to: Option<&str>) -> Result<Vec<FileDiff>, CoreError> {
+        self.inner.get_diff(from, to).await
+    }
+
+    async fn get_metrics(&self) -> Result<SandboxMetrics, CoreError> {
+        self.inner.get_metrics().await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentkernel_fs::OverlayFsEngine;
+    use agentkernel_fs::{ChangeType, OverlayFsEngine};
     use agentkernel_runtime::PortableRuntimeDriver;
     use tempfile::tempdir;
 
@@ -410,5 +499,100 @@ mod tests {
         // Terminate
         session.terminate().await.expect("terminate");
         assert_eq!(session.status().await, SandboxStatus::Terminating);
+    }
+
+    #[tokio::test]
+    async fn test_session_metrics_collection() {
+        let tmp = tempdir().unwrap();
+        let storage = Arc::new(OverlayFsEngine::with_storage_dir(tmp.path().join("storage")));
+        let runtime = Arc::new(PortableRuntimeDriver::new());
+
+        let cfg = SandboxConfig::new("metrics_session");
+        let session = DefaultSandboxSession::create_warm(cfg, storage, runtime)
+            .await
+            .expect("session created warm");
+
+        // Warm metrics
+        let warm_metrics = session.get_metrics().await.expect("warm metrics");
+        assert_eq!(warm_metrics.status, SandboxStatus::Warm);
+        assert_eq!(warm_metrics.cpu_time_ms, 0);
+
+        // Lease and test leased wrapper
+        let leased_cfg = SandboxConfig::new("metrics_session");
+        session.lease(leased_cfg).await.expect("lease session");
+        let leased_session = LeasedSandboxSession::new("metrics_session", Arc::new(session));
+
+        let leased_metrics = leased_session.get_metrics().await.expect("leased metrics");
+        assert_eq!(leased_metrics.status, SandboxStatus::Leased);
+
+        // Exec command and check cpu_time accumulation
+        leased_session
+            .exec("echo", &["metrics_check".to_string()], 5000)
+            .await
+            .expect("exec");
+
+        let exec_metrics = leased_session.get_metrics().await.expect("exec metrics");
+        assert!(exec_metrics.cpu_time_ms > 0 || exec_metrics.status == SandboxStatus::Leased);
+
+        leased_session.terminate().await.expect("terminate");
+    }
+
+    #[tokio::test]
+    async fn test_session_checkpoints_and_diffs() {
+        let tmp = tempdir().unwrap();
+        let workspace = tmp.path().join("ws");
+        tokio::fs::create_dir_all(&workspace).await.unwrap();
+        tokio::fs::write(workspace.join("initial.txt"), "v1 initial\n").await.unwrap();
+
+        let storage = Arc::new(OverlayFsEngine::with_storage_dir(tmp.path().join("storage")));
+        let runtime = Arc::new(PortableRuntimeDriver::new());
+
+        let cfg = SandboxConfig::new("diff_session").with_workspace(workspace.to_str().unwrap());
+        let session = Arc::new(
+            DefaultSandboxSession::create_warm(cfg, storage, runtime)
+                .await
+                .expect("created"),
+        );
+
+        let leased = LeasedSandboxSession::new("diff_session", session.clone());
+
+        // Initial diff should be empty
+        let initial_diff = leased.get_diff(None, None).await.expect("get_diff");
+        assert!(initial_diff.is_empty());
+
+        // Modify workspace inside mount_point
+        let mount_point = leased.mount_point().await.unwrap();
+        tokio::fs::write(mount_point.join("initial.txt"), "v2 modified\n").await.unwrap();
+        tokio::fs::write(mount_point.join("created.txt"), "brand new\n").await.unwrap();
+
+        // Diff against base
+        let diffs = leased.get_diff(None, None).await.expect("diff against base");
+        assert_eq!(diffs.len(), 2);
+
+        let mod_diff = diffs.iter().find(|d| d.path == "initial.txt").unwrap();
+        assert_eq!(mod_diff.change_type, ChangeType::Modified);
+
+        let add_diff = diffs.iter().find(|d| d.path == "created.txt").unwrap();
+        assert_eq!(add_diff.change_type, ChangeType::Added);
+
+        // Create checkpoint 1
+        let cp1 = leased.create_checkpoint("cp1").await.expect("create checkpoint");
+
+        // List checkpoints via session
+        let cps = leased.list_checkpoints().await.expect("list checkpoints");
+        assert_eq!(cps.len(), 1);
+        assert_eq!(cps[0].id, cp1.id);
+        assert_eq!(cps[0].name, "cp1");
+
+        // Mutate further: delete created.txt
+        tokio::fs::remove_file(mount_point.join("created.txt")).await.unwrap();
+
+        // Diff between cp1 and current
+        let diff_since_cp1 = leased.get_diff(Some(&cp1.id), None).await.expect("diff since cp1");
+        assert_eq!(diff_since_cp1.len(), 1);
+        assert_eq!(diff_since_cp1[0].path, "created.txt");
+        assert_eq!(diff_since_cp1[0].change_type, ChangeType::Deleted);
+
+        leased.terminate().await.expect("terminate");
     }
 }

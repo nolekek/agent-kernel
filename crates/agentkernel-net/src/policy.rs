@@ -76,6 +76,18 @@ impl EgressPolicy {
         }
         false
     }
+
+    /// Dynamically appends a new domain to the allowed domains list if not already present.
+    pub fn allow_domain(&mut self, domain: &str) {
+        let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+        if !self
+            .allowed_domains
+            .iter()
+            .any(|d| d.trim_end_matches('.').to_ascii_lowercase() == normalized)
+        {
+            self.allowed_domains.push(normalized);
+        }
+    }
 }
 
 /// CIDR representation supporting IPv4 and IPv6 subnet calculations.
@@ -229,5 +241,19 @@ mod tests {
         assert!(!policy.is_ip_blocked("140.82.121.4".parse().unwrap())); // GitHub
         assert!(!policy.is_ip_blocked("1.1.1.1".parse().unwrap())); // Cloudflare
         assert!(!policy.is_ip_blocked("8.8.8.8".parse().unwrap())); // Google
+    }
+
+    #[test]
+    fn test_dynamic_allow_domain() {
+        let mut policy = EgressPolicy::default();
+        assert!(!policy.is_domain_allowed("custom-api.anthropic.com"));
+
+        policy.allow_domain("custom-api.anthropic.com");
+        assert!(policy.is_domain_allowed("custom-api.anthropic.com"));
+
+        // Deduplication
+        let count_before = policy.allowed_domains.len();
+        policy.allow_domain("custom-api.anthropic.com.");
+        assert_eq!(policy.allowed_domains.len(), count_before);
     }
 }

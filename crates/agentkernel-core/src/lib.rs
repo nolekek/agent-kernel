@@ -3,8 +3,11 @@
 pub mod pool;
 pub mod sandbox;
 
+pub use agentkernel_fs::{ChangeType, Checkpoint, CheckpointInfo, FileDiff, StorageUsage};
 pub use pool::{PoolConfig, PoolManager, WarmPool};
-pub use sandbox::{DefaultSandboxSession, LeasedSandboxSession, SandboxConfig, SandboxSession};
+pub use sandbox::{
+    DefaultSandboxSession, LeasedSandboxSession, SandboxConfig, SandboxMetrics, SandboxSession,
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

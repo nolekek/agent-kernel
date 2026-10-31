@@ -8,7 +8,9 @@ pub mod policy;
 
 pub use controller::SmartNetGuard;
 pub use dns_proto::{DnsQuery, DnsRcode, DnsRecordType};
-pub use dns_proxy::{DnsProxy, DnsResolver, MockResolver, SystemResolver};
+pub use dns_proxy::{
+    DnsAuditDecision, DnsAuditEntry, DnsProxy, DnsResolver, MockResolver, SystemResolver,
+};
 pub use nftables::NftablesGenerator;
 pub use policy::{CidrBlock, EgressPolicy};
 

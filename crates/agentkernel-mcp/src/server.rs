@@ -1,20 +1,24 @@
 //! AgentKernel MCP Server (JSON-RPC 2.0 over stdio & HTTP/SSE).
 
+use crate::diff::compute_directory_diff;
 use crate::local_pool::LocalPoolManager;
+use crate::metrics::{compute_dir_size, get_process_rss_bytes, SandboxMetrics};
 use crate::protocol::*;
 use crate::tools::*;
 use agentkernel_core::pool::PoolManager;
 use agentkernel_core::sandbox::{SandboxConfig, SandboxSession};
 use agentkernel_core::CoreError;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -32,11 +36,59 @@ pub enum McpError {
     ToolExecution(String),
 }
 
+/// Persistent metadata for tracking sessions across process boundaries
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionMetadata {
+    pub session_id: String,
+    pub workspace_path: String,
+    pub created_at_rfc3339: String,
+    pub checkpoints: Vec<agentkernel_fs::Checkpoint>,
+}
+
+pub fn session_store_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join("agentkernel_sessions");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+pub fn save_session_metadata(meta: &SessionMetadata) {
+    let path = session_store_dir().join(format!("{}.json", meta.session_id));
+    if let Ok(json) = serde_json::to_string_pretty(meta) {
+        let _ = std::fs::write(path, json);
+    }
+}
+
+pub fn load_session_metadata(session_id: &str) -> Option<SessionMetadata> {
+    let path = session_store_dir().join(format!("{}.json", session_id));
+    if let Ok(content) = std::fs::read_to_string(path) {
+        serde_json::from_str(&content).ok()
+    } else {
+        None
+    }
+}
+
+pub fn update_session_checkpoint(session_id: &str, cp: &agentkernel_fs::Checkpoint) {
+    if let Some(mut meta) = load_session_metadata(session_id) {
+        meta.checkpoints.retain(|c| c.id != cp.id);
+        meta.checkpoints.push(cp.clone());
+        save_session_metadata(&meta);
+    }
+}
+
+pub fn remove_session_metadata(session_id: &str) {
+    let path = session_store_dir().join(format!("{}.json", session_id));
+    let _ = std::fs::remove_file(path);
+}
+
 /// Active session tracking within the MCP server
 pub struct ActiveSessionRecord {
     pub session: Arc<dyn SandboxSession>,
     pub workspace_path: PathBuf,
     pub config: SandboxConfig,
+    pub created_at: std::time::Instant,
+    pub checkpoints: Arc<RwLock<Vec<agentkernel_fs::Checkpoint>>>,
+    pub total_cpu_time_ms: Arc<AtomicU64>,
+    pub stream_tx: broadcast::Sender<String>,
 }
 
 /// High-Performance Model Context Protocol Server for AgentKernel.
@@ -127,7 +179,7 @@ impl AgentKernelMcpServer {
         }
     }
 
-    /// Dispatches execution of the 7 supported sandbox tools
+    /// Dispatches execution of the supported sandbox tools
     async fn execute_tool(&self, name: &str, args: Value) -> CallToolResult {
         match name {
             "sandbox_acquire" => self.tool_acquire(args).await,
@@ -137,6 +189,9 @@ impl AgentKernelMcpServer {
             "sandbox_create_checkpoint" => self.tool_create_checkpoint(args).await,
             "sandbox_rollback" => self.tool_rollback(args).await,
             "sandbox_release" => self.tool_release(args).await,
+            "sandbox_diff" => self.tool_diff(args).await,
+            "sandbox_list_checkpoints" => self.tool_list_checkpoints(args).await,
+            "sandbox_metrics" => self.tool_metrics(args).await,
             unknown => CallToolResult::error(format!("Unknown tool: '{unknown}'")),
         }
     }
@@ -171,12 +226,24 @@ impl AgentKernelMcpServer {
 
         match self.pool_manager.acquire_sandbox(config.clone()).await {
             Ok(session) => {
+                let (stream_tx, _) = broadcast::channel(256);
                 let record = ActiveSessionRecord {
                     session,
                     workspace_path: PathBuf::from(&workspace_path),
                     config,
+                    created_at: std::time::Instant::now(),
+                    checkpoints: Arc::new(RwLock::new(Vec::new())),
+                    total_cpu_time_ms: Arc::new(AtomicU64::new(0)),
+                    stream_tx,
                 };
                 self.sessions.write().await.insert(session_id.clone(), record);
+
+                save_session_metadata(&SessionMetadata {
+                    session_id: session_id.clone(),
+                    workspace_path: workspace_path.clone(),
+                    created_at_rfc3339: chrono::Utc::now().to_rfc3339(),
+                    checkpoints: Vec::new(),
+                });
 
                 CallToolResult::success_json(&json!({
                     "session_id": session_id,
@@ -207,15 +274,51 @@ impl AgentKernelMcpServer {
 
         let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(30_000);
 
-        let sessions = self.sessions.read().await;
-        let record = match sessions.get(session_id) {
-            Some(r) => r,
-            None => return CallToolResult::error(format!("Sandbox session '{session_id}' not found")),
+        let (session, stream_tx, total_cpu) = {
+            let sessions = self.sessions.read().await;
+            let record = match sessions.get(session_id) {
+                Some(r) => r,
+                None => return CallToolResult::error(format!("Sandbox session '{session_id}' not found")),
+            };
+            (record.session.clone(), record.stream_tx.clone(), record.total_cpu_time_ms.clone())
         };
 
-        match record.session.exec(cmd, &cmd_args, timeout_ms).await {
-            Ok(output) => CallToolResult::success_json(&output),
-            Err(e) => CallToolResult::error(format!("Command execution failed: {e}")),
+        let _ = stream_tx.send(json!({
+            "event": "exec_start",
+            "cmd": cmd,
+            "args": cmd_args,
+        }).to_string());
+
+        match session.exec(cmd, &cmd_args, timeout_ms).await {
+            Ok(output) => {
+                total_cpu.fetch_add(output.duration_ms, Ordering::Relaxed);
+                if !output.stdout.is_empty() {
+                    let _ = stream_tx.send(json!({
+                        "event": "stdout",
+                        "data": output.stdout,
+                    }).to_string());
+                }
+                if !output.stderr.is_empty() {
+                    let _ = stream_tx.send(json!({
+                        "event": "stderr",
+                        "data": output.stderr,
+                    }).to_string());
+                }
+                let _ = stream_tx.send(json!({
+                    "event": "exec_exit",
+                    "exit_code": output.exit_code,
+                    "duration_ms": output.duration_ms,
+                }).to_string());
+
+                CallToolResult::success_json(&output)
+            }
+            Err(e) => {
+                let _ = stream_tx.send(json!({
+                    "event": "exec_error",
+                    "error": e.to_string(),
+                }).to_string());
+                CallToolResult::error(format!("Command execution failed: {e}"))
+            }
         }
     }
 
@@ -341,12 +444,17 @@ impl AgentKernelMcpServer {
         };
 
         match record.session.create_checkpoint(name).await {
-            Ok(cp) => CallToolResult::success_json(&json!({
-                "checkpoint_id": cp.id,
-                "name": cp.name,
-                "created_at": cp.created_at,
-                "upperdir_path": cp.upperdir_path
-            })),
+            Ok(cp) => {
+                record.checkpoints.write().await.push(cp.clone());
+                update_session_checkpoint(session_id, &cp);
+
+                CallToolResult::success_json(&json!({
+                    "checkpoint_id": cp.id,
+                    "name": cp.name,
+                    "created_at": cp.created_at,
+                    "upperdir_path": cp.upperdir_path
+                }))
+            }
             Err(e) => CallToolResult::error(format!("Failed to create checkpoint: {e}")),
         }
     }
@@ -389,6 +497,8 @@ impl AgentKernelMcpServer {
             return CallToolResult::error(format!("Sandbox session '{session_id}' not found"));
         }
 
+        remove_session_metadata(session_id);
+
         match self.pool_manager.release_sandbox(session_id).await {
             Ok(_) => CallToolResult::success_json(&json!({
                 "success": true,
@@ -397,6 +507,173 @@ impl AgentKernelMcpServer {
             })),
             Err(e) => CallToolResult::error(format!("Failed to release sandbox: {e}")),
         }
+    }
+
+    async fn tool_diff(&self, args: Value) -> CallToolResult {
+        let session_id = match args.get("session_id").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => return CallToolResult::error("Missing required parameter 'session_id'"),
+        };
+
+        let from_cp_id = args.get("from_checkpoint").and_then(|v| v.as_str());
+        let to_cp_id = args.get("to_checkpoint").and_then(|v| v.as_str());
+
+        let (workspace_path, checkpoints) = {
+            let sessions = self.sessions.read().await;
+            if let Some(record) = sessions.get(session_id) {
+                let cps = record.checkpoints.read().await.clone();
+                (record.workspace_path.clone(), cps)
+            } else if let Some(meta) = load_session_metadata(session_id) {
+                (PathBuf::from(meta.workspace_path), meta.checkpoints)
+            } else {
+                return CallToolResult::error(format!("Sandbox session '{session_id}' not found"));
+            }
+        };
+
+        // Determine from_dir
+        let from_dir = match from_cp_id {
+            Some(from_id) => {
+                if let Some(cp) = checkpoints.iter().find(|c| c.id == from_id || c.name == from_id) {
+                    cp.upperdir_path.clone()
+                } else {
+                    let disk_path = workspace_path.join(".agentkernel").join("checkpoints").join(from_id);
+                    if disk_path.exists() {
+                        disk_path
+                    } else {
+                        return CallToolResult::error(format!("Checkpoint '{from_id}' not found"));
+                    }
+                }
+            }
+            None => {
+                if let Some(last_cp) = checkpoints.last() {
+                    last_cp.upperdir_path.clone()
+                } else {
+                    workspace_path.clone()
+                }
+            }
+        };
+
+        // Determine to_dir
+        let to_dir = match to_cp_id {
+            Some(to_id) => {
+                if let Some(cp) = checkpoints.iter().find(|c| c.id == to_id || c.name == to_id) {
+                    cp.upperdir_path.clone()
+                } else {
+                    let disk_path = workspace_path.join(".agentkernel").join("checkpoints").join(to_id);
+                    if disk_path.exists() {
+                        disk_path
+                    } else {
+                        return CallToolResult::error(format!("Checkpoint '{to_id}' not found"));
+                    }
+                }
+            }
+            None => workspace_path.clone(),
+        };
+
+        match compute_directory_diff(&from_dir, &to_dir, &[".agentkernel"]) {
+            Ok(diff) => CallToolResult::success_json(&json!({
+                "files": diff.files,
+                "diff": diff.diff,
+            })),
+            Err(e) => CallToolResult::error(format!("Failed to compute diff: {e}")),
+        }
+    }
+
+    async fn tool_list_checkpoints(&self, args: Value) -> CallToolResult {
+        let session_id = match args.get("session_id").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => return CallToolResult::error("Missing required parameter 'session_id'"),
+        };
+
+        let (workspace_path, mut checkpoints) = {
+            let sessions = self.sessions.read().await;
+            if let Some(record) = sessions.get(session_id) {
+                let cps = record.checkpoints.read().await.clone();
+                (record.workspace_path.clone(), cps)
+            } else if let Some(meta) = load_session_metadata(session_id) {
+                (PathBuf::from(meta.workspace_path), meta.checkpoints)
+            } else {
+                return CallToolResult::error(format!("Sandbox session '{session_id}' not found"));
+            }
+        };
+
+        let disk_cp_dir = workspace_path.join(".agentkernel").join("checkpoints");
+        if disk_cp_dir.exists() {
+            if let Ok(entries) = std::fs::read_dir(&disk_cp_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        let id = entry.file_name().to_string_lossy().to_string();
+                        if !checkpoints.iter().any(|c| c.id == id) {
+                            checkpoints.push(agentkernel_fs::Checkpoint {
+                                id: id.clone(),
+                                name: id,
+                                created_at: chrono::Utc::now(),
+                                upperdir_path: path,
+                                parent_id: None,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut list = Vec::new();
+        for cp in checkpoints {
+            let size_bytes = compute_dir_size(&cp.upperdir_path);
+            list.push(json!({
+                "id": cp.id,
+                "name": cp.name,
+                "created_at": cp.created_at.to_rfc3339(),
+                "size_bytes": size_bytes,
+            }));
+        }
+
+        CallToolResult::success_json(&list)
+    }
+
+    async fn tool_metrics(&self, args: Value) -> CallToolResult {
+        let session_id = match args.get("session_id").and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => return CallToolResult::error("Missing required parameter 'session_id'"),
+        };
+
+        let (workspace_path, uptime_seconds, cpu_time_ms) = {
+            let sessions = self.sessions.read().await;
+            if let Some(record) = sessions.get(session_id) {
+                let uptime = record.created_at.elapsed().as_secs();
+                let cpu = record.total_cpu_time_ms.load(Ordering::Relaxed);
+                (record.workspace_path.clone(), uptime, cpu)
+            } else if let Some(meta) = load_session_metadata(session_id) {
+                let uptime = chrono::DateTime::parse_from_rfc3339(&meta.created_at_rfc3339)
+                    .map(|dt| (chrono::Utc::now() - dt.with_timezone(&chrono::Utc)).num_seconds().max(0) as u64)
+                    .unwrap_or(0);
+                (PathBuf::from(meta.workspace_path), uptime, 0)
+            } else {
+                return CallToolResult::error(format!("Sandbox session '{session_id}' not found"));
+            }
+        };
+
+        let ram_rss = get_process_rss_bytes();
+        let disk_layer = {
+            let dot_ak = workspace_path.join(".agentkernel");
+            if dot_ak.exists() {
+                compute_dir_size(&dot_ak)
+            } else {
+                compute_dir_size(&workspace_path)
+            }
+        };
+
+        let metrics = SandboxMetrics {
+            session_id: session_id.to_string(),
+            status: "leased".to_string(),
+            uptime_seconds,
+            cpu_time_ms,
+            ram_rss_bytes: ram_rss,
+            disk_layer_bytes: disk_layer,
+        };
+
+        CallToolResult::success_json(&metrics)
     }
 
     /// Run the server loop reading lines from an async reader and writing JSON-RPC to writer
@@ -572,6 +849,78 @@ async fn handle_http_connection(
             }
         }
         return Ok(());
+    }
+
+    // Sandbox output stream endpoint: GET /sandbox/:id/stream
+    if method == "GET" && uri.starts_with("/sandbox/") && uri.ends_with("/stream") {
+        let parts: Vec<&str> = uri.split('/').collect();
+        // uri format: /sandbox/<id>/stream -> parts: ["", "sandbox", "<id>", "stream"]
+        if parts.len() >= 4 {
+            let session_id = parts[2];
+            let rx_opt = {
+                let sessions = server.sessions.read().await;
+                sessions.get(session_id).map(|r| r.stream_tx.subscribe())
+            };
+
+            match rx_opt {
+                Some(mut rx) => {
+                    let header = "HTTP/1.1 200 OK\r\n\
+                                  Content-Type: text/event-stream\r\n\
+                                  Cache-Control: no-cache\r\n\
+                                  Connection: keep-alive\r\n\
+                                  Access-Control-Allow-Origin: *\r\n\r\n";
+                    writer.write_all(header.as_bytes()).await?;
+                    writer.flush().await?;
+
+                    let init_event = format!(
+                        "event: connected\r\ndata: {}\r\n\r\n",
+                        json!({ "session_id": session_id, "status": "streaming" })
+                    );
+                    writer.write_all(init_event.as_bytes()).await?;
+                    writer.flush().await?;
+
+                    let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+                    loop {
+                        tokio::select! {
+                            msg_res = rx.recv() => {
+                                match msg_res {
+                                    Ok(msg) => {
+                                        let sse_chunk = format!("event: output\r\ndata: {}\r\n\r\n", msg);
+                                        if writer.write_all(sse_chunk.as_bytes()).await.is_err() {
+                                            break;
+                                        }
+                                        if writer.flush().await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                                    Err(_) => break,
+                                }
+                            }
+                            _ = ping_interval.tick() => {
+                                if writer.write_all(b": ping\r\n\r\n").await.is_err() {
+                                    break;
+                                }
+                                if writer.flush().await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    return Ok(());
+                }
+                None => {
+                    let not_found = "HTTP/1.1 404 Not Found\r\n\
+                                     Content-Type: application/json\r\n\
+                                     Access-Control-Allow-Origin: *\r\n\
+                                     Content-Length: 39\r\n\r\n\
+                                     {\"error\":\"Sandbox session not found\"}\n";
+                    writer.write_all(not_found.as_bytes()).await?;
+                    writer.flush().await?;
+                    return Ok(());
+                }
+            }
+        }
     }
 
     // JSON-RPC HTTP POST handling (/message, /mcp, /)

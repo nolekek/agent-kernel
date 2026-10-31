@@ -72,6 +72,37 @@ impl SmartNetGuard {
         let map = self.active_networks.read().unwrap();
         map.get(netns_name).map(|state| state.dns_proxy.port())
     }
+
+    /// Dynamically appends an allowed domain to the active DNS proxy for a netns.
+    pub fn allow_domain(&self, netns_name: &str, domain: &str) -> Result<(), NetError> {
+        let map = self.active_networks.read().unwrap();
+        if let Some(state) = map.get(netns_name) {
+            state.dns_proxy.allow_domain(domain);
+            Ok(())
+        } else {
+            Err(NetError::Netns(format!(
+                "Network namespace '{}' is not active",
+                netns_name
+            )))
+        }
+    }
+
+    /// Retrieves the recent DNS audit log entries for a netns.
+    pub fn get_audit_log(&self, netns_name: &str) -> Option<Vec<crate::dns_proxy::DnsAuditEntry>> {
+        let map = self.active_networks.read().unwrap();
+        map.get(netns_name).map(|state| state.dns_proxy.get_audit_log())
+    }
+
+    /// Returns the metrics tuple (allowed_requests_total, blocked_requests_total) for a netns.
+    pub fn get_metrics(&self, netns_name: &str) -> Option<(u64, u64)> {
+        let map = self.active_networks.read().unwrap();
+        map.get(netns_name).map(|state| {
+            (
+                state.dns_proxy.allowed_requests_total(),
+                state.dns_proxy.blocked_requests_total(),
+            )
+        })
+    }
 }
 
 #[async_trait]
@@ -184,5 +215,39 @@ mod tests {
 
         assert!(!guard.is_network_active(netns));
         assert!(guard.get_ruleset(netns).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_smart_net_guard_allow_domain_and_telemetry() {
+        let mock = Arc::new(MockResolver::new());
+        mock.insert(
+            "custom.model.ai",
+            vec![IpAddr::V4(Ipv4Addr::new(104, 18, 20, 30))],
+        );
+
+        let guard = SmartNetGuard::with_resolver(mock);
+        let policy = EgressPolicy::default();
+        let netns = "telemetry_test_net";
+
+        guard
+            .setup_isolate_network(netns, &policy)
+            .await
+            .expect("Setup should succeed");
+
+        // Initial metrics should be 0, 0
+        assert_eq!(guard.get_metrics(netns), Some((0, 0)));
+        assert_eq!(guard.get_audit_log(netns).unwrap().len(), 0);
+
+        // Dynamically allow custom domain
+        guard
+            .allow_domain(netns, "custom.model.ai")
+            .expect("allow_domain should succeed");
+
+        guard
+            .teardown_isolate_network(netns)
+            .await
+            .expect("Teardown should succeed");
+
+        assert_eq!(guard.get_metrics(netns), None);
     }
 }

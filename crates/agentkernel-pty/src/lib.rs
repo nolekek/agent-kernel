@@ -1,9 +1,13 @@
 //! AgentKernel PTY: Pseudo-terminal multiplexer and LLM Token Guard.
 
+pub mod ansi;
 pub mod manager;
+pub mod session;
 pub mod token_guard;
 
+pub use ansi::strip_ansi;
 pub use manager::PtyManager;
+pub use session::{InteractiveSession, PtyOutputChunk, PtyStreamer};
 pub use token_guard::{TokenGuard, TokenGuardRingBuffer, TruncateResult};
 
 use async_trait::async_trait;

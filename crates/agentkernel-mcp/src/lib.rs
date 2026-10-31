@@ -3,12 +3,16 @@
 //! Provides a compliant JSON-RPC 2.0 / MCP 2024-11-05 server over stdio and HTTP/SSE transports,
 //! exposing isolated micro-sandbox primitives for autonomous AI coding agents.
 
+pub mod diff;
 pub mod local_pool;
+pub mod metrics;
 pub mod protocol;
 pub mod server;
 pub mod tools;
 
+pub use diff::{compute_directory_diff, DirectoryDiff};
 pub use local_pool::{LocalPoolManager, LocalSandboxSession};
+pub use metrics::{compute_dir_size, get_process_rss_bytes, SandboxMetrics};
 pub use protocol::{
     CallToolResult, InitializeResult, JsonRpcError, JsonRpcRequest, JsonRpcResponse, ServerCapabilities,
     ServerInfo, Tool, ToolContent, ToolsCapability,
@@ -57,7 +61,7 @@ mod tests {
 
         let result = resp.result.expect("Expected tools list");
         let tools = result["tools"].as_array().expect("Expected tools array");
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 10);
 
         let tool_names: Vec<&str> = tools
             .iter()
@@ -71,6 +75,9 @@ mod tests {
         assert!(tool_names.contains(&"sandbox_create_checkpoint"));
         assert!(tool_names.contains(&"sandbox_rollback"));
         assert!(tool_names.contains(&"sandbox_release"));
+        assert!(tool_names.contains(&"sandbox_diff"));
+        assert!(tool_names.contains(&"sandbox_list_checkpoints"));
+        assert!(tool_names.contains(&"sandbox_metrics"));
     }
 
     #[tokio::test]
@@ -348,6 +355,274 @@ mod tests {
         assert_eq!(resp.id, Some(json!(42)));
         assert_eq!(resp.result, Some(json!({})));
 
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_mcp_diff_checkpoint_and_metrics() {
+        let tmp = tempdir().expect("Failed to create tempdir");
+        let workspace_path = tmp.path().to_str().unwrap().to_string();
+
+        let server = AgentKernelMcpServer::with_local_pool(2);
+
+        // 1. Acquire
+        let acq_resp = server.handle_request(JsonRpcRequest::new(
+            Some(json!(1)),
+            "tools/call",
+            Some(json!({
+                "name": "sandbox_acquire",
+                "arguments": { "workspace_path": workspace_path }
+            })),
+        )).await;
+        let acq_txt = acq_resp.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
+        let acq_val: serde_json::Value = serde_json::from_str(&acq_txt).unwrap();
+        let session_id = acq_val["session_id"].as_str().unwrap().to_string();
+
+        // 2. Write initial file
+        server.handle_request(JsonRpcRequest::new(
+            Some(json!(2)),
+            "tools/call",
+            Some(json!({
+                "name": "sandbox_write_patch",
+                "arguments": {
+                    "session_id": session_id,
+                    "path": "test.txt",
+                    "content": "line 1\nline 2\n"
+                }
+            })),
+        )).await;
+
+        // 3. Create checkpoint
+        let cp_resp = server.handle_request(JsonRpcRequest::new(
+            Some(json!(3)),
+            "tools/call",
+            Some(json!({
+                "name": "sandbox_create_checkpoint",
+                "arguments": {
+                    "session_id": session_id,
+                    "name": "v1.0"
+                }
+            })),
+        )).await;
+        let cp_txt = cp_resp.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
+        let cp_val: serde_json::Value = serde_json::from_str(&cp_txt).unwrap();
+        let cp_id = cp_val["checkpoint_id"].as_str().unwrap().to_string();
+
+        // 4. List checkpoints
+        let list_resp = server.handle_request(JsonRpcRequest::new(
+            Some(json!(4)),
+            "tools/call",
+            Some(json!({
+                "name": "sandbox_list_checkpoints",
+                "arguments": { "session_id": session_id }
+            })),
+        )).await;
+        let list_txt = list_resp.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
+        let list_val: serde_json::Value = serde_json::from_str(&list_txt).unwrap();
+        let cps = list_val.as_array().unwrap();
+        assert_eq!(cps.len(), 1);
+        assert_eq!(cps[0]["name"], "v1.0");
+        assert!(cps[0]["size_bytes"].as_u64().unwrap() > 0);
+
+        // 5. Query metrics
+        let met_resp = server.handle_request(JsonRpcRequest::new(
+            Some(json!(5)),
+            "tools/call",
+            Some(json!({
+                "name": "sandbox_metrics",
+                "arguments": { "session_id": session_id }
+            })),
+        )).await;
+        let met_txt = met_resp.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
+        let met_val: serde_json::Value = serde_json::from_str(&met_txt).unwrap();
+        assert_eq!(met_val["status"], "leased");
+        assert!(met_val["ram_rss_bytes"].as_u64().unwrap() > 0);
+
+        // 6. Mutate file and add a second file
+        server.handle_request(JsonRpcRequest::new(
+            Some(json!(6)),
+            "tools/call",
+            Some(json!({
+                "name": "sandbox_write_patch",
+                "arguments": {
+                    "session_id": session_id,
+                    "path": "test.txt",
+                    "content": "line 1\nline 2 modified\n"
+                }
+            })),
+        )).await;
+
+        server.handle_request(JsonRpcRequest::new(
+            Some(json!(7)),
+            "tools/call",
+            Some(json!({
+                "name": "sandbox_write_patch",
+                "arguments": {
+                    "session_id": session_id,
+                    "path": "new.txt",
+                    "content": "brand new file\n"
+                }
+            })),
+        )).await;
+
+        // 7. Check diff against cp1
+        let diff_resp = server.handle_request(JsonRpcRequest::new(
+            Some(json!(8)),
+            "tools/call",
+            Some(json!({
+                "name": "sandbox_diff",
+                "arguments": {
+                    "session_id": session_id,
+                    "from_checkpoint": cp_id
+                }
+            })),
+        )).await;
+        let diff_txt = diff_resp.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
+        let diff_val: serde_json::Value = serde_json::from_str(&diff_txt).unwrap();
+        let files = diff_val["files"].as_array().unwrap();
+        assert_eq!(files.len(), 2);
+        let diff_str = diff_val["diff"].as_str().unwrap();
+        assert!(diff_str.contains("--- a/test.txt"));
+        assert!(diff_str.contains("+line 2 modified"));
+        assert!(diff_str.contains("+++ b/new.txt"));
+
+        // 8. Rollback
+        server.handle_request(JsonRpcRequest::new(
+            Some(json!(9)),
+            "tools/call",
+            Some(json!({
+                "name": "sandbox_rollback",
+                "arguments": {
+                    "session_id": session_id,
+                    "checkpoint_id": cp_id
+                }
+            })),
+        )).await;
+
+        // 9. Diff after rollback should be clean
+        let diff2_resp = server.handle_request(JsonRpcRequest::new(
+            Some(json!(10)),
+            "tools/call",
+            Some(json!({
+                "name": "sandbox_diff",
+                "arguments": {
+                    "session_id": session_id,
+                    "from_checkpoint": cp_id
+                }
+            })),
+        )).await;
+        let diff2_txt = diff2_resp.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
+        let diff2_val: serde_json::Value = serde_json::from_str(&diff2_txt).unwrap();
+        assert_eq!(diff2_val["files"].as_array().unwrap().len(), 0);
+
+        // 10. Release
+        server.handle_request(JsonRpcRequest::new(
+            Some(json!(11)),
+            "tools/call",
+            Some(json!({
+                "name": "sandbox_release",
+                "arguments": { "session_id": session_id }
+            })),
+        )).await;
+    }
+
+    #[tokio::test]
+    async fn test_http_sse_streaming() {
+        let tmp = tempdir().expect("Failed to create tempdir");
+        let workspace_path = tmp.path().to_str().unwrap().to_string();
+
+        let server = Arc::new(AgentKernelMcpServer::with_local_pool(1));
+
+        // Start HTTP server on local random free port
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let server_addr = format!("127.0.0.1:{port}");
+        let server_clone = server.clone();
+        let addr_clone = server_addr.clone();
+        let server_task = tokio::spawn(async move {
+            let _ = server_clone.run_http_sse(&addr_clone).await;
+        });
+
+        // Give server time to bind
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Acquire sandbox
+        let acq_resp = server.handle_request(JsonRpcRequest::new(
+            Some(json!(1)),
+            "tools/call",
+            Some(json!({
+                "name": "sandbox_acquire",
+                "arguments": { "workspace_path": workspace_path }
+            })),
+        )).await;
+        let acq_txt = acq_resp.result.unwrap()["content"][0]["text"].as_str().unwrap().to_string();
+        let acq_val: serde_json::Value = serde_json::from_str(&acq_txt).unwrap();
+        let session_id = acq_val["session_id"].as_str().unwrap().to_string();
+
+        // Connect SSE stream
+        let mut stream_sock = tokio::net::TcpStream::connect(&server_addr).await.unwrap();
+        let req = format!("GET /sandbox/{session_id}/stream HTTP/1.1\r\nHost: {server_addr}\r\n\r\n");
+        tokio::io::AsyncWriteExt::write_all(&mut stream_sock, req.as_bytes()).await.unwrap();
+
+        let mut buf_reader = tokio::io::BufReader::new(stream_sock);
+        let mut line = String::new();
+
+        // Read headers until \r\n\r\n
+        loop {
+            line.clear();
+            let n = tokio::io::AsyncBufReadExt::read_line(&mut buf_reader, &mut line).await.unwrap();
+            assert!(n > 0);
+            if line.trim().is_empty() {
+                break;
+            }
+        }
+
+        // Read event: connected
+        line.clear();
+        tokio::io::AsyncBufReadExt::read_line(&mut buf_reader, &mut line).await.unwrap();
+        assert!(line.contains("event: connected"));
+
+        // Trigger command execution in background
+        let server_clone2 = server.clone();
+        let session_id_clone = session_id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let (cmd, args) = if cfg!(windows) {
+                ("cmd", vec!["/C".to_string(), "echo".to_string(), "streaming-test-output".to_string()])
+            } else {
+                ("echo", vec!["streaming-test-output".to_string()])
+            };
+            let _ = server_clone2.handle_request(JsonRpcRequest::new(
+                Some(json!(2)),
+                "tools/call",
+                Some(json!({
+                    "name": "sandbox_exec",
+                    "arguments": {
+                        "session_id": session_id_clone,
+                        "cmd": cmd,
+                        "args": args
+                    }
+                })),
+            )).await;
+        });
+
+        // Read SSE stream lines and look for "streaming-test-output"
+        let mut found_output = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            line.clear();
+            if let Ok(Ok(n)) = tokio::time::timeout(std::time::Duration::from_millis(500), tokio::io::AsyncBufReadExt::read_line(&mut buf_reader, &mut line)).await {
+                if n == 0 { break; }
+                if line.contains("streaming-test-output") {
+                    found_output = true;
+                    break;
+                }
+            }
+        }
+
+        assert!(found_output, "SSE stream must receive command output in real time");
         server_task.abort();
     }
 }

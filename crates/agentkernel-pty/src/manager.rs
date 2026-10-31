@@ -55,6 +55,22 @@ impl PtyManager {
             .map(|res| (res.master, res.slave))
             .map_err(|e| PtyError::Allocation(e.to_string()))
     }
+
+    /// Spawns an interactive bidirectional session with streaming broadcast and signal support.
+    pub fn spawn_interactive(
+        &self,
+        cmd: &str,
+        args: &[String],
+        working_dir: &str,
+    ) -> Result<crate::session::InteractiveSession, PtyError> {
+        crate::session::InteractiveSession::spawn(
+            cmd,
+            args,
+            working_dir,
+            self.default_max_lines,
+            self.max_bytes,
+        )
+    }
 }
 
 #[async_trait]
@@ -168,7 +184,7 @@ impl PtyRunner for PtyManager {
 }
 
 /// Helper function to build cross-platform commands.
-fn build_command(cmd: &str, args: &[String], working_dir: &str) -> tokio::process::Command {
+pub(crate) fn build_command(cmd: &str, args: &[String], working_dir: &str) -> tokio::process::Command {
     let mut command = if cfg!(target_os = "windows") {
         if cmd == "echo" || cmd == "dir" || cmd == "type" || cmd == "cd" {
             let mut c = tokio::process::Command::new("cmd");

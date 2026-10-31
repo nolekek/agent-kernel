@@ -51,11 +51,68 @@ enum Commands {
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
+    /// Manage filesystem snapshots and checkpoints
+    Snapshot {
+        #[command(subcommand)]
+        command: SnapshotCommands,
+    },
+    /// Show resource and performance statistics for a sandbox session
+    Stats {
+        /// Session ID of the sandbox
+        #[arg(long)]
+        session_id: String,
+
+        /// Server address to query (default: http://127.0.0.1:8080)
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        server: String,
+    },
+    /// Launch an interactive shell inside a sandbox workspace
+    Shell {
+        /// Workspace directory on host
+        #[arg(short = 'w', long)]
+        workspace: String,
+
+        /// Custom shell command to launch (default: powershell on Windows, bash on Unix)
+        #[arg(short, long)]
+        shell: Option<String>,
+    },
     /// Benchmark cold-boot latency and snapshot performance
     Benchmark {
         /// Number of iterations for benchmarking
         #[arg(short, long, default_value = "10")]
         iterations: usize,
+    },
+}
+
+#[derive(Subcommand)]
+enum SnapshotCommands {
+    /// List all checkpoints/snapshots for a sandbox session
+    List {
+        /// Session ID of the sandbox
+        #[arg(long)]
+        session_id: String,
+
+        /// Server address to query (default: http://127.0.0.1:8080)
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        server: String,
+    },
+    /// Unified diff between checkpoints or current workspace
+    Diff {
+        /// Session ID of the sandbox
+        #[arg(long)]
+        session_id: String,
+
+        /// Starting checkpoint ID (optional)
+        #[arg(long)]
+        from: Option<String>,
+
+        /// Target checkpoint ID (optional)
+        #[arg(long)]
+        to: Option<String>,
+
+        /// Server address to query (default: http://127.0.0.1:8080)
+        #[arg(long, default_value = "http://127.0.0.1:8080")]
+        server: String,
     },
 }
 
@@ -130,12 +187,310 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
+        Commands::Snapshot { command } => match command {
+            SnapshotCommands::List { session_id, server } => {
+                handle_snapshot_list(&session_id, &server).await?;
+            }
+            SnapshotCommands::Diff { session_id, from, to, server } => {
+                handle_snapshot_diff(&session_id, from.as_deref(), to.as_deref(), &server).await?;
+            }
+        },
+
+        Commands::Stats { session_id, server } => {
+            handle_stats(&session_id, &server).await?;
+        }
+
+        Commands::Shell { workspace, shell } => {
+            handle_shell(&workspace, shell.as_deref()).await?;
+        }
+
         Commands::Benchmark { iterations } => {
             run_benchmark(iterations).await?;
         }
     }
 
     Ok(())
+}
+
+async fn handle_snapshot_list(session_id: &str, server: &str) -> anyhow::Result<()> {
+    let args = serde_json::json!({ "session_id": session_id });
+    let val = call_mcp_tool(server, "sandbox_list_checkpoints", args).await?;
+
+    let checkpoints = val.as_array().ok_or_else(|| anyhow::anyhow!("Expected array of checkpoints"))?;
+    if checkpoints.is_empty() {
+        println!("No checkpoints found for sandbox session '{session_id}'.");
+        return Ok(());
+    }
+
+    println!("==========================================================================================");
+    println!("  Checkpoints for Session: {}", session_id);
+    println!("==========================================================================================");
+    println!("  {:<38} {:<16} {:<24} {:<10}", "ID", "NAME", "CREATED AT", "SIZE");
+    println!("  {:-<38} {:-<16} {:-<24} {:-<10}", "", "", "", "");
+
+    for cp in checkpoints {
+        let id = cp["id"].as_str().unwrap_or("-");
+        let name = cp["name"].as_str().unwrap_or("-");
+        let created_at = cp["created_at"].as_str().unwrap_or("-");
+        let size_bytes = cp["size_bytes"].as_u64().unwrap_or(0);
+        let size_str = format_bytes(size_bytes);
+
+        println!("  {:<38} {:<16} {:<24} {:<10}", id, name, created_at, size_str);
+    }
+
+    println!("==========================================================================================");
+    println!("  Total: {} checkpoint(s)", checkpoints.len());
+    Ok(())
+}
+
+async fn handle_snapshot_diff(
+    session_id: &str,
+    from: Option<&str>,
+    to: Option<&str>,
+    server: &str,
+) -> anyhow::Result<()> {
+    let mut args = serde_json::json!({ "session_id": session_id });
+    if let Some(f) = from {
+        args["from_checkpoint"] = serde_json::Value::String(f.to_string());
+    }
+    if let Some(t) = to {
+        args["to_checkpoint"] = serde_json::Value::String(t.to_string());
+    }
+
+    let val = call_mcp_tool(server, "sandbox_diff", args).await?;
+    let files = val["files"].as_array().cloned().unwrap_or_default();
+    let diff = val["diff"].as_str().unwrap_or_default();
+
+    if files.is_empty() {
+        println!("No changes detected between checkpoints/workspace.");
+        return Ok(());
+    }
+
+    println!("Changed files ({}):", files.len());
+    for f in &files {
+        if let Some(path) = f.as_str() {
+            println!("  • {}", path);
+        }
+    }
+    println!();
+    println!("Unified Diff:");
+    println!("------------------------------------------------------------");
+    print!("{diff}");
+    println!("------------------------------------------------------------");
+    Ok(())
+}
+
+async fn handle_stats(session_id: &str, server: &str) -> anyhow::Result<()> {
+    let args = serde_json::json!({ "session_id": session_id });
+    let val = call_mcp_tool(server, "sandbox_metrics", args).await?;
+
+    let status = val["status"].as_str().unwrap_or("unknown");
+    let uptime = val["uptime_seconds"].as_u64().unwrap_or(0);
+    let cpu_ms = val["cpu_time_ms"].as_u64().unwrap_or(0);
+    let ram_rss = val["ram_rss_bytes"].as_u64().unwrap_or(0);
+    let disk_bytes = val["disk_layer_bytes"].as_u64().unwrap_or(0);
+
+    println!("============================================================");
+    println!("           AgentKernel Sandbox Resource Metrics             ");
+    println!("============================================================");
+    println!("  Session ID:        {}", session_id);
+    println!("  Status:            {}", status);
+    println!("  Uptime:            {}s", uptime);
+    println!("  CPU Time:          {} ms", cpu_ms);
+    println!("  RAM RSS:           {} ({} bytes)", format_bytes(ram_rss), ram_rss);
+    println!("  Disk Upper Layer:  {} ({} bytes)", format_bytes(disk_bytes), disk_bytes);
+    println!("============================================================");
+    Ok(())
+}
+
+async fn handle_shell(workspace: &str, custom_shell: Option<&str>) -> anyhow::Result<()> {
+    let ws_path = std::path::Path::new(workspace);
+    if !ws_path.exists() {
+        tokio::fs::create_dir_all(ws_path).await?;
+    }
+
+    let (shell_cmd, shell_args) = if let Some(cmd) = custom_shell {
+        (cmd.to_string(), vec![])
+    } else if cfg!(windows) {
+        ("powershell.exe".to_string(), vec!["-NoLogo".to_string()])
+    } else {
+        let sh = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+        (sh, vec![])
+    };
+
+    println!("============================================================");
+    println!("     AgentKernel Interactive Sandbox Shell Session          ");
+    println!("============================================================");
+    println!("  Workspace: {}", ws_path.canonicalize().unwrap_or_else(|_| ws_path.to_path_buf()).display());
+    println!("  Shell:     {}", shell_cmd);
+    println!("  Type 'exit' to quit the interactive session.");
+    println!("============================================================");
+
+    let mut process_cmd = std::process::Command::new(&shell_cmd);
+    process_cmd
+        .args(&shell_args)
+        .current_dir(ws_path)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .env("AGENTKERNEL_WORKSPACE", workspace);
+
+    let mut child = process_cmd.spawn()
+        .map_err(|e| anyhow::anyhow!("Failed to launch shell '{shell_cmd}': {e}"))?;
+
+    let exit_status = child.wait()?;
+    let code = exit_status.code().unwrap_or(0);
+
+    println!();
+    println!("Interactive shell session terminated (exit code: {}).", code);
+
+    if code != 0 {
+        std::process::exit(code);
+    }
+
+    Ok(())
+}
+
+async fn call_mcp_tool(
+    server: &str,
+    tool_name: &str,
+    args: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let host_port = server
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split('/')
+        .next()
+        .unwrap_or("127.0.0.1:8080");
+
+    let rpc_req = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {
+            "name": tool_name,
+            "arguments": args
+        }
+    });
+    let body = serde_json::to_vec(&rpc_req)?;
+
+    if let Ok(mut stream) = tokio::net::TcpStream::connect(host_port).await {
+        let req_header = format!(
+            "POST /message HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            host_port,
+            body.len()
+        );
+        tokio::io::AsyncWriteExt::write_all(&mut stream, req_header.as_bytes()).await?;
+        tokio::io::AsyncWriteExt::write_all(&mut stream, &body).await?;
+        tokio::io::AsyncWriteExt::flush(&mut stream).await?;
+
+        let mut resp_bytes = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut resp_bytes).await?;
+
+        if let Some(pos) = resp_bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+            let body_bytes = &resp_bytes[pos + 4..];
+            if let Ok(rpc_resp) = serde_json::from_slice::<serde_json::Value>(body_bytes) {
+                if let Some(err) = rpc_resp.get("error") {
+                    anyhow::bail!("MCP error: {}", err["message"].as_str().unwrap_or("unknown error"));
+                }
+                if let Some(content) = rpc_resp["result"]["content"].as_array() {
+                    if let Some(first) = content.first() {
+                        if let Some(text) = first["text"].as_str() {
+                            if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(text) {
+                                return Ok(json_val);
+                            } else {
+                                return Ok(serde_json::Value::String(text.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback: check local session store on disk
+    let session_id = args.get("session_id").and_then(|v| v.as_str()).unwrap_or_default();
+    if let Some(meta) = agentkernel_mcp::server::load_session_metadata(session_id) {
+        match tool_name {
+            "sandbox_list_checkpoints" => {
+                let mut list = Vec::new();
+                for cp in meta.checkpoints {
+                    let size_bytes = agentkernel_mcp::metrics::compute_dir_size(&cp.upperdir_path);
+                    list.push(serde_json::json!({
+                        "id": cp.id,
+                        "name": cp.name,
+                        "created_at": cp.created_at.to_rfc3339(),
+                        "size_bytes": size_bytes,
+                    }));
+                }
+                return Ok(serde_json::Value::Array(list));
+            }
+            "sandbox_diff" => {
+                let from_cp_id = args.get("from_checkpoint").and_then(|v| v.as_str());
+                let to_cp_id = args.get("to_checkpoint").and_then(|v| v.as_str());
+                let workspace = std::path::PathBuf::from(&meta.workspace_path);
+
+                let from_dir = if let Some(from_id) = from_cp_id {
+                    meta.checkpoints.iter().find(|c| c.id == from_id || c.name == from_id)
+                        .map(|c| c.upperdir_path.clone())
+                        .unwrap_or_else(|| workspace.join(".agentkernel").join("checkpoints").join(from_id))
+                } else if let Some(last_cp) = meta.checkpoints.last() {
+                    last_cp.upperdir_path.clone()
+                } else {
+                    workspace.clone()
+                };
+
+                let to_dir = if let Some(to_id) = to_cp_id {
+                    meta.checkpoints.iter().find(|c| c.id == to_id || c.name == to_id)
+                        .map(|c| c.upperdir_path.clone())
+                        .unwrap_or_else(|| workspace.join(".agentkernel").join("checkpoints").join(to_id))
+                } else {
+                    workspace.clone()
+                };
+
+                let diff = agentkernel_mcp::compute_directory_diff(&from_dir, &to_dir, &[".agentkernel"])?;
+                return Ok(serde_json::json!({
+                    "files": diff.files,
+                    "diff": diff.diff,
+                }));
+            }
+            "sandbox_metrics" => {
+                let uptime = chrono::DateTime::parse_from_rfc3339(&meta.created_at_rfc3339)
+                    .map(|dt| (chrono::Utc::now() - dt.with_timezone(&chrono::Utc)).num_seconds().max(0) as u64)
+                    .unwrap_or(0);
+                let workspace = std::path::PathBuf::from(&meta.workspace_path);
+                let disk_layer = agentkernel_mcp::metrics::compute_dir_size(&workspace);
+                let ram_rss = agentkernel_mcp::metrics::get_process_rss_bytes();
+                return Ok(serde_json::json!({
+                    "session_id": session_id,
+                    "status": "leased",
+                    "uptime_seconds": uptime,
+                    "cpu_time_ms": 0,
+                    "ram_rss_bytes": ram_rss,
+                    "disk_layer_bytes": disk_layer,
+                }));
+            }
+            _ => anyhow::bail!("Unsupported tool fallback: {tool_name}"),
+        }
+    }
+
+    anyhow::bail!(
+        "Failed to query MCP daemon at {} and no active local session found for '{}'",
+        server,
+        session_id
+    )
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
 }
 
 /// Runs cold-boot, warm-boot, execution, snapshot and rollback benchmarks
