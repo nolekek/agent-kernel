@@ -1,0 +1,28 @@
+[package]
+name = "agentkernel-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agentkernel"
+path = "src/main.rs"
+
+[[test]]
+name = "integration_test"
+path = "../../tests/integration_test.rs"
+
+[dependencies]
+agentkernel-core = { workspace = true }
+agentkernel-mcp = { workspace = true }
+agentkernel-fs = { workspace = true }
+agentkernel-pty = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tempfile = { workspace = true }

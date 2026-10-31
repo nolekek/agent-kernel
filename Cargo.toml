@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/agentkernel-core",
+    "crates/agentkernel-runtime",
+    "crates/agentkernel-fs",
+    "crates/agentkernel-net",
+    "crates/agentkernel-pty",
+    "crates/agentkernel-mcp",
+    "crates/agentkernel-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["AgentKernel Contributors"]
+license = "Apache-2.0"
+repository = "https://github.com/nolekek/agent-kernel"
+
+[workspace.dependencies]
+tokio = { version = "1.40", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.5", features = ["derive"] }
+uuid = { version = "1.10", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tempfile = "3.12"
+async-trait = "0.1"
+
+# Internal crate dependencies
+agentkernel-core = { path = "crates/agentkernel-core" }
+agentkernel-runtime = { path = "crates/agentkernel-runtime" }
+agentkernel-fs = { path = "crates/agentkernel-fs" }
+agentkernel-net = { path = "crates/agentkernel-net" }
+agentkernel-pty = { path = "crates/agentkernel-pty" }
+agentkernel-mcp = { path = "crates/agentkernel-mcp" }
